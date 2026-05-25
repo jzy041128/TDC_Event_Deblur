@@ -1,0 +1,16 @@
+# configs/train_mamba.yml
+name: Mamba_Event_Deblur_Base
+
+datasets:
+  train:
+    dataroot: ./datasets/train   # 这里存放你所有的 .h5 训练文件
+    batch_size: 4
+    num_worker: 4
+    patch_size: 256
+
+  val:
+    dataroot: ./datasets/val     # 这里存放验证集的 .h5 文件
+    
+train:
+  epochs: 100
+  lr: 0.0002
