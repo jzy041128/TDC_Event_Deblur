@@ -1,26 +1,10 @@
+from models.tdc_deblur_net import TDC_Deblur_Net
 import torch
 import torch.nn as nn
 import yaml
 from torch.utils.data import DataLoader
 from data.dataset import EventDeblurDataset
 
-# ========================================================
-# 临时占位模型：等你的真实网络写好后，直接替换掉这个类即可
-# ========================================================
-class DummyModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        # 输入：模糊图像(3通道) + 事件数据(6通道) = 9通道
-        self.net = nn.Sequential(
-            nn.Conv2d(9, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 3, kernel_size=3, padding=1) # 输出：清晰图像(3通道)
-        )
-
-    def forward(self, blur, event):
-        # 把图像和事件在通道维度(dim=1)拼起来
-        x = torch.cat([blur, event], dim=1) 
-        return self.net(x)
 
 # ========================================================
 # 训练主循环
@@ -45,7 +29,7 @@ def main():
     )
 
     # 3. 初始化模型、损失函数和优化器
-    model = DummyModel().to(device)
+    model = TDC_Deblur_Net().to(device)
     criterion = nn.L1Loss()  # 去模糊常用的 L1 Loss
     optimizer = torch.optim.Adam(model.parameters(), lr=opt['train']['lr'])
 
