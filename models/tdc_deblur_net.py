@@ -1,61 +1,49 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from models.tdc_module import TDCBlock3D
+from models.sta_module import CrossModalSTA
 
-# ==========================================
-# 1. 简化的时空上下文注意力模块 (魔改自 STA)
-# 导师要求：用单帧 RGB 指导 事件体素
-# ==========================================
-class CrossModalSTA(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        # 这是一个简化的交叉注意力示意
-        # rgb_feat 生成注意力权重，去增强 event_feat
-        self.conv_rgb = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-        self.conv_event = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-        self.conv_out = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, rgb_feat, event_feat):
-        # 1. RGB 特征生成 Spatial Attention Map
-        attention_map = self.sigmoid(self.conv_rgb(rgb_feat))
-        
-        # 2. 用 RGB 的注意力去调制 (Modulate) 事件特征
-        event_projected = self.conv_event(event_feat)
-        fused_feat = event_projected * attention_map
-        
-        # 3. 融合后输出
-        return self.conv_out(fused_feat + rgb_feat)
-
-# ==========================================
-# 2. 编解码器主网络 (Encoder-Decoder)
-# 导师要求：改成去模糊架构
-# ==========================================
 class TDC_Deblur_Net(nn.Module):
-    def __init__(self, rgb_in=3, event_in=6, base_dim=64):
+    def __init__(self, rgb_in=3, event_in=6, base_dim=32):
         super().__init__()
         
-        # --- 双分支 Encoder (分别提取 RGB 和 Event 的浅层特征) ---
+        # ==========================================
+        # 1. RGB 编码器 (提取单帧 2D 空间特征)
+        # ==========================================
         self.encoder_rgb = nn.Sequential(
             nn.Conv2d(rgb_in, base_dim, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, True),
-            nn.Conv2d(base_dim, base_dim, kernel_size=3, padding=1, stride=2) # 下采样
+            nn.Conv2d(base_dim, base_dim, kernel_size=3, padding=1, stride=2) # 空间下采样
         )
-        
-        # 这里预留给你接原论文的 TDC (时序差分卷积) 模块
-        # 因为事件 Voxel 天生带有时间维度，用 TDC 处理再合适不过了
+
+        # ==========================================
+        # 2. Event 编码器 (提取 3D 时空动态特征)
+        # ==========================================
         self.encoder_event = nn.Sequential(
-            nn.Conv2d(event_in, base_dim, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(base_dim, base_dim, kernel_size=3, padding=1, stride=2) # 下采样
+            # 接入导师的创新点：3D TDC 模块
+            TDCBlock3D(in_channels=1, out_channels=base_dim),
+            # 空间下采样 (stride=(1,2,2) 保证时间维度 T=6 不变，只对 H 和 W 缩小一半)
+            nn.Conv3d(base_dim, base_dim, kernel_size=(1, 3, 3), padding=(0, 1, 1), stride=(1, 2, 2)),
+            nn.LeakyReLU(0.2, True)
         )
-        
-        # --- 核心融合层 (导师要求的 RGB 指导 Event) ---
+
+        # ==========================================
+        # 3. 跨模态融合 (导师的创新点：RGB 指导 Event)
+        # ==========================================
         self.sta_fusion = CrossModalSTA(in_channels=base_dim)
-        
-        # --- Decoder (解码恢复清晰图像) ---
+
+        # ==========================================
+        # 4. 3D 转 2D 桥接层
+        # ==========================================
+        # 融合后的 Event 依然是 3D 的，我们需要把它压扁回 2D，才能和 RGB 拼接去解码
+        self.time_pool = nn.AdaptiveAvgPool3d((1, None, None)) # 把时间维度平均池化掉
+        self.fusion_conv = nn.Conv2d(base_dim * 2, base_dim, kernel_size=3, padding=1)
+
+        # ==========================================
+        # 5. 解码器 (恢复 2D 清晰图像)
+        # ==========================================
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(base_dim, base_dim, kernel_size=4, stride=2, padding=1), # 上采样
+            nn.ConvTranspose2d(base_dim, base_dim, kernel_size=4, stride=2, padding=1), # 上采样放大
             nn.LeakyReLU(0.2, True),
             nn.Conv2d(base_dim, base_dim, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2, True),
@@ -63,28 +51,44 @@ class TDC_Deblur_Net(nn.Module):
         )
 
     def forward(self, blur, event):
-        # 1. 编码提取特征
-        feat_rgb = self.encoder_rgb(blur)
-        feat_event = self.encoder_event(event)
+        # blur: (B, 3, H, W)
+        # event: (B, 6, H, W)
         
-        # 2. 特征融合 (STA模块)
-        feat_fused = self.sta_fusion(feat_rgb, feat_event)
+        # --- 1. 特征编码 ---
+        feat_rgb = self.encoder_rgb(blur) # 输出: (B, base_dim, H/2, W/2)
+
+        # 核心变形：升维打击，把通道 6 变成时间维度 6
+        event_3d = event.unsqueeze(1)     # 变成: (B, 1, 6, H, W)
+        feat_event = self.encoder_event(event_3d) # 输出: (B, base_dim, 6, H/2, W/2)
+
+        # --- 2. 跨模态融合 ---
+        fused_event_3d = self.sta_fusion(feat_rgb, feat_event) # 输出依然保留 3D
+
+        # --- 3. 3D 转 2D 桥接与拼接 ---
+        # 把时间 T=6 压缩掉，去掉多余的维度 1
+        fused_event_2d = self.time_pool(fused_event_3d).squeeze(2) # 变成: (B, base_dim, H/2, W/2)
         
-        # 3. 解码输出清晰图像 (加上 blur 做全局残差连接，去模糊常用技巧)
-        out = self.decoder(feat_fused)
-        return out + blur
+        # 拼接 RGB 特征和融合后的 Event 特征
+        concat_feat = torch.cat([feat_rgb, fused_event_2d], dim=1) # 通道翻倍
+        bottleneck_feat = self.fusion_conv(concat_feat) # 通道恢复到 base_dim
+
+        # --- 4. 解码输出 ---
+        out = self.decoder(bottleneck_feat)
+        
+        return out + blur # 全局残差，去模糊必备
 
 # ==========================================
-# 简单的维度测试
+# 测试代码
 # ==========================================
 if __name__ == '__main__':
-    # 模拟我们之前 DataLoader 读出来的维度
     dummy_blur = torch.randn(4, 3, 256, 256)
     dummy_event = torch.randn(4, 6, 256, 256)
     
     model = TDC_Deblur_Net()
     out = model(dummy_blur, dummy_event)
     
+    print("\n--- 终极网络大合体测试 ---")
     print("输入 Blur 维度:", dummy_blur.shape)
     print("输入 Event 维度:", dummy_event.shape)
     print("输出 清晰图像 维度:", out.shape)
+    print("网络参数量:", sum(p.numel() for p in model.parameters() if p.requires_grad))

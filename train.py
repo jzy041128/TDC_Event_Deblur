@@ -14,7 +14,7 @@ def main():
     with open('configs/train_tdc.yml', 'r') as f:
         opt = yaml.safe_load(f)
 
-    device = torch.device('cpu')#device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda')#device = torch.device('cpu')
     print(f"正在使用设备: {device}")
 
     # 2. 准备数据
