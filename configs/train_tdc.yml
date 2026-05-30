@@ -1,16 +1,29 @@
-# configs/train_mamba.yml
-name: Mamba_Event_Deblur_Base
+# ==============================
+# 实验基本信息
+# ==============================
+name: TDC_GoPro_Train
 
+# ==============================
+# 数据集路径配置 (GOPRO 架构)
+# ==============================
 datasets:
   train:
-    dataroot: ./datasets/train   # 这里存放你所有的 .h5 训练文件
-    batch_size: 4
-    num_worker: 4
-    patch_size: 256
-
+    dataroot: ./datasets/GOPRO/train
+    batch_size: 8
+    num_workers: 8
   val:
-    dataroot: ./datasets/val     # 这里存放验证集的 .h5 文件
-    
+    dataroot: ./datasets/GOPRO/test 
+
+# ==============================
+# 训练参数
+# ==============================
 train:
-  epochs: 100
-  lr: 0.0002
+  num_epochs: 100
+  learning_rate: 0.0002
+
+# ==============================
+# 路径与断点续训 (核心升级！)
+# ==============================
+path:
+  experiments_root: ./experiments
+  resume_state: ~

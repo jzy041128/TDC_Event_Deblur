@@ -1,63 +1,167 @@
-from models.tdc_deblur_net import TDC_Deblur_Net
+import os
+import sys
+import yaml
+import time
+import datetime
 import torch
 import torch.nn as nn
-import yaml
+import torch.optim as optim
 from torch.utils.data import DataLoader
+import numpy as np
+
+# 导入极其权威的 skimage 指标计算
+from skimage.metrics import peak_signal_noise_ratio as calculate_psnr
+from skimage.metrics import structural_similarity as calculate_ssim
+
 from data.dataset import EventDeblurDataset
+from models.tdc_deblur_net import TDC_Deblur_Net
 
+class Logger(object):
+    """
+    终端输出双向拦截器：既在屏幕上打印，又同时写入 txt 文件
+    """
+    def __init__(self, filename="Default.log"):
+        self.terminal = sys.stdout
+        self.log = open(filename, "a", encoding='utf-8')
 
-# ========================================================
-# 训练主循环
-# ========================================================
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush() # 实时强制写入硬盘
+
+    def flush(self):
+        pass
+
+def tensor2img(tensor):
+    """
+    将 PyTorch 的 Tensor (B, C, H, W) 转换为 NumPy 的图像格式 (H, W, C)
+    以便送入 skimage 计算指标
+    """
+    img = tensor.detach().cpu().squeeze().numpy() # 假设 batch_size=1 时验证
+    if img.ndim == 4: # 如果 batch > 1，只取第一张算
+        img = img[0]
+    img = np.transpose(img, (1, 2, 0)) # CHW -> HWC
+    img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+    return img
+
 def main():
-    # 1. 读取配置
-    with open('configs/train_tdc.yml', 'r') as f:
-        opt = yaml.safe_load(f)
+    # 1. 加载配置
+    with open('configs/train_tdc.yml', 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
 
-    device = torch.device('cuda')#device = torch.device('cpu')
-    print(f"正在使用设备: {device}")
+    # 2. 建立带时间戳的实验文件夹 (绝不覆盖旧数据！)
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    exp_name = f"{config['name']}_{timestamp}"
+    exp_dir = os.path.join(config['path']['experiments_root'], exp_name)
+    os.makedirs(exp_dir, exist_ok=True)
+    sys.stdout = Logger(os.path.join(exp_dir, "train_log.txt"))
+    print(f"🚀 本次实验的所有存档将保存在: {exp_dir}")
 
-    # 2. 准备数据
-    train_dataset = EventDeblurDataset(opt['datasets']['train'])
+    # 3. 设置设备 (2060 GPU 全开)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"💻 正在使用设备: {device}")
+
+    # 4. 加载数据 (Train 和 Val)
+    train_dataset = EventDeblurDataset(opt_dataset=config['datasets']['train'])
+    train_loader = DataLoader(train_dataset, 
+                              batch_size=config['datasets']['train']['batch_size'], 
+                              shuffle=True, 
+                              num_workers=config['datasets']['train'].get('num_workers', 4),
+                              pin_memory=True)
     
-    # 注意：在 WSL 里刚开始测试时，num_workers 最好先设为 0，防止多进程读取 h5 报错
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=opt['datasets']['train']['batch_size'], 
-        shuffle=True, 
-        num_workers=0 
-    )
+    val_dataset = EventDeblurDataset(opt_dataset=config['datasets']['val'])
+    val_loader = DataLoader(val_dataset, 
+                            batch_size=1, 
+                            shuffle=False, 
+                            num_workers=0, 
+                            pin_memory=True)
 
-    # 3. 初始化模型、损失函数和优化器
+    # 5. 初始化模型、损失函数、优化器
     model = TDC_Deblur_Net().to(device)
-    criterion = nn.L1Loss()  # 去模糊常用的 L1 Loss
-    optimizer = torch.optim.Adam(model.parameters(), lr=opt['train']['lr'])
+    criterion = nn.L1Loss() # 图像恢复首选 L1 Loss
+    optimizer = optim.AdamW(model.parameters(), lr=config['train']['learning_rate'])
 
-    epochs = opt['train']['epochs']
-    print("\n🚀 开始训练大循环...")
+    # 6. 👇 核心功能：断点续训 (Resume) 👇
+    start_epoch = 0
+    best_psnr = 0.0
+    resume_path = config['path'].get('resume_state')
+    
+    if resume_path and resume_path != '~':
+        if os.path.exists(resume_path):
+            print(f"🔄 发现存档文件！正在从 {resume_path} 恢复训练...")
+            checkpoint = torch.load(resume_path)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch']
+            best_psnr = checkpoint.get('best_psnr', 0.0)
+            print(f"✅ 成功恢复至第 {start_epoch} 个 Epoch！历史最佳 PSNR: {best_psnr:.2f} dB")
+        else:
+            print(f"⚠️ 找不到存档文件 {resume_path}，将从头开始训练！")
 
-    # 4. 真正开始训练
-    for epoch in range(epochs):
+    # 7. 开始训练大循环
+    num_epochs = config['train']['num_epochs']
+    
+    for epoch in range(start_epoch, num_epochs):
         model.train()
         epoch_loss = 0.0
         
-        for i, batch in enumerate(train_loader):
-            # 将数据搬运到显卡上
-            blur = batch['blur'].to(device)
-            gt = batch['gt'].to(device)
-            event = batch['event'].to(device)
+        # --- 训练阶段 ---
+        for step, batch_data in enumerate(train_loader):
+            blur = batch_data['blur'].to(device)
+            event = batch_data['event'].to(device)
+            gt = batch_data['gt'].to(device)
 
-            # --- 核心三步曲 ---
-            optimizer.zero_grad()            # 清空上一轮梯度
-            output = model(blur, event)      # 前向传播 (推断)
-            loss = criterion(output, gt)     # 计算误差
-            loss.backward()                  # 反向传播 (求导)
-            optimizer.step()                 # 更新权重
+            optimizer.zero_grad()
+            pred = model(blur, event)
+            loss = criterion(pred, gt)
+            loss.backward()
+            optimizer.step()
 
             epoch_loss += loss.item()
-            
-            # 打印进度 (这里设置为每个 batch 都打印，方便你看到 loss 变化)
-            print(f"Epoch [{epoch+1}/{epochs}], Step [{i+1}/{len(train_loader)}], Loss: {loss.item():.4f}")
+            if (step + 1) % 10 == 0:
+                print(f"Epoch [{epoch+1}/{num_epochs}], Step [{step+1}/{len(train_loader)}], Loss: {loss.item():.4f}")
+
+        # --- 验证阶段 (Validation Loop) ---
+        print(f"\n⏳ Epoch {epoch+1} 训练结束，开始在 Test 集上验证...")
+        model.eval()
+        total_psnr, total_ssim = 0.0, 0.0
+        
+        with torch.no_grad():
+            for val_batch in val_loader:
+                val_blur = val_batch['blur'].to(device)
+                val_event = val_batch['event'].to(device)
+                val_gt = val_batch['gt'].to(device)
+                
+                val_pred = model(val_blur, val_event)
+                
+                # 转换格式计算指标
+                pred_np = tensor2img(val_pred)
+                gt_np = tensor2img(val_gt)
+                
+                # 计算 PSNR 和 SSIM (channel_axis=2 代表颜色通道在最后)
+                total_psnr += calculate_psnr(gt_np, pred_np)
+                total_ssim += calculate_ssim(gt_np, pred_np, channel_axis=2)
+                
+        avg_psnr = total_psnr / len(val_loader)
+        avg_ssim = total_ssim / len(val_loader)
+        print(f"📈 验证结果 -> 平均 PSNR: {avg_psnr:.2f} dB | 平均 SSIM: {avg_ssim:.4f}\n")
+
+        # --- 存档阶段 (Save Checkpoints) ---
+        save_dict = {
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'best_psnr': best_psnr
+        }
+        
+        # 1. 每跑完一个 Epoch，覆盖保存一次 latest.pth (防停电)
+        torch.save(save_dict, os.path.join(exp_dir, 'latest.pth'))
+        
+        # 2. 如果分刷出了新高，保存为 best.pth
+        if avg_psnr > best_psnr:
+            best_psnr = avg_psnr
+            print(f"✨ 突破历史记录！正在保存最佳模型 (PSNR: {best_psnr:.2f})")
+            torch.save(save_dict, os.path.join(exp_dir, 'best.pth'))
 
 if __name__ == '__main__':
     main()
