@@ -4,15 +4,39 @@
 name: TDC_GoPro_Train
 
 # ==============================
+# 模型配置
+# type 可选: multiscale, attention, concat, no_event
+# fusion_type 可选: hybrid, channel_window, window_all, cat_all
+# qkv_mode 可选: rgb_qk_event_v, rgb_q_event_kv, rgb_qk_event_v_gate
+# ==============================
+model:
+  type: multiscale
+  base_dim: 24
+  fusion_type: hybrid
+  qkv_mode: rgb_qk_event_v
+  window_size: 8
+  num_heads: 4
+
+# ==============================
+# 损失函数配置
+# type 可选: l1, charbonnier, charbonnier_edge
+# ==============================
+loss:
+  type: l1
+  edge_weight: 0.05
+
+# ==============================
 # 数据集路径配置 (GOPRO 架构)
 # ==============================
 datasets:
   train:
-    dataroot: ./datasets/GOPRO/train
-    batch_size: 8
-    num_workers: 8
+    dataroot: E:/GOPRO/GOPRO/train
+    patch_size: 128
+    batch_size: 1
+    num_workers: 2
   val:
-    dataroot: ./datasets/GOPRO/test 
+    dataroot: E:/GOPRO/GOPRO/test
+    patch_size: 128
 
 # ==============================
 # 训练参数

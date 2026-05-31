@@ -14,7 +14,8 @@ from skimage.metrics import peak_signal_noise_ratio as calculate_psnr
 from skimage.metrics import structural_similarity as calculate_ssim
 
 from data.dataset import EventDeblurDataset
-from models.tdc_deblur_net import TDC_Deblur_Net
+from models.losses import build_loss
+from models.tdc_deblur_net import build_deblur_model
 
 class Logger(object):
     """
@@ -43,6 +44,14 @@ def tensor2img(tensor):
     img = np.transpose(img, (1, 2, 0)) # CHW -> HWC
     img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
     return img
+
+
+def tensor2float_img(tensor):
+    img = tensor.detach().cpu().squeeze().numpy()
+    if img.ndim == 4:
+        img = img[0]
+    img = np.transpose(img, (1, 2, 0))
+    return np.clip(img, 0.0, 1.0)
 
 def main():
     # 1. 加载配置
@@ -77,8 +86,32 @@ def main():
                             pin_memory=True)
 
     # 5. 初始化模型、损失函数、优化器
-    model = TDC_Deblur_Net().to(device)
-    criterion = nn.L1Loss() # 图像恢复首选 L1 Loss
+    model_cfg = config.get('model', {})
+    model_type = model_cfg.get('type', 'attention')
+    base_dim = model_cfg.get('base_dim', 32)
+    fusion_type = model_cfg.get('fusion_type', 'hybrid')
+    qkv_mode = model_cfg.get('qkv_mode', 'rgb_qk_event_v')
+    window_size = model_cfg.get('window_size', 8)
+    num_heads = model_cfg.get('num_heads', 4)
+    model = build_deblur_model(
+        model_type=model_type,
+        base_dim=base_dim,
+        fusion_type=fusion_type,
+        qkv_mode=qkv_mode,
+        window_size=window_size,
+        num_heads=num_heads,
+    ).to(device)
+    print(
+        f"Model type: {model_type} | base_dim: {base_dim} | "
+        f"fusion_type: {fusion_type} | qkv_mode: {qkv_mode} | "
+        f"window_size: {window_size} | num_heads: {num_heads}"
+    )
+    loss_cfg = config.get('loss', {})
+    criterion = build_loss(
+        loss_type=loss_cfg.get('type', 'l1'),
+        edge_weight=loss_cfg.get('edge_weight', 0.05),
+    )
+    print(f"Loss type: {loss_cfg.get('type', 'l1')} | edge_weight: {loss_cfg.get('edge_weight', 0.05)}")
     optimizer = optim.AdamW(model.parameters(), lr=config['train']['learning_rate'])
 
     # 6. 👇 核心功能：断点续训 (Resume) 👇
@@ -124,7 +157,7 @@ def main():
         # --- 验证阶段 (Validation Loop) ---
         print(f"\n⏳ Epoch {epoch+1} 训练结束，开始在 Test 集上验证...")
         model.eval()
-        total_psnr, total_ssim = 0.0, 0.0
+        total_blur_psnr, total_pred_psnr, total_ssim = 0.0, 0.0, 0.0
         
         with torch.no_grad():
             for val_batch in val_loader:
@@ -135,16 +168,20 @@ def main():
                 val_pred = model(val_blur, val_event)
                 
                 # 转换格式计算指标
-                pred_np = tensor2img(val_pred)
-                gt_np = tensor2img(val_gt)
+                pred_np = tensor2float_img(val_pred)
+                blur_np = tensor2float_img(val_blur)
+                gt_np = tensor2float_img(val_gt)
                 
                 # 计算 PSNR 和 SSIM (channel_axis=2 代表颜色通道在最后)
-                total_psnr += calculate_psnr(gt_np, pred_np)
-                total_ssim += calculate_ssim(gt_np, pred_np, channel_axis=2)
+                total_blur_psnr += calculate_psnr(gt_np, blur_np, data_range=1.0)
+                total_pred_psnr += calculate_psnr(gt_np, pred_np, data_range=1.0)
+                total_ssim += calculate_ssim(gt_np, pred_np, channel_axis=2, data_range=1.0)
                 
-        avg_psnr = total_psnr / len(val_loader)
+        avg_blur_psnr = total_blur_psnr / len(val_loader)
+        avg_psnr = total_pred_psnr / len(val_loader)
         avg_ssim = total_ssim / len(val_loader)
-        print(f"📈 验证结果 -> 平均 PSNR: {avg_psnr:.2f} dB | 平均 SSIM: {avg_ssim:.4f}\n")
+        psnr_gain = avg_psnr - avg_blur_psnr
+        print(f"📈 验证结果 -> Blur PSNR: {avg_blur_psnr:.2f} dB | Pred PSNR: {avg_psnr:.2f} dB | Gain: {psnr_gain:+.2f} dB | SSIM: {avg_ssim:.4f}\n")
 
         # --- 存档阶段 (Save Checkpoints) ---
         save_dict = {
