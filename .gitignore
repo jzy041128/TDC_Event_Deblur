@@ -1,3 +1,6 @@
 *.h5
+experiments/
+*.pth
+*.pt
 
 __pycache__/
