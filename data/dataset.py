@@ -11,6 +11,7 @@ class EventDeblurDataset(Dataset):
         super().__init__()
         self.dataroot = opt_dataset['dataroot']
         self.patch_size = opt_dataset.get('patch_size', 256)
+        self.random_crop = opt_dataset.get('random_crop', True)
         
         # 1. 找到目录下所有的 .h5 文件
         self.h5_files = glob.glob(os.path.join(self.dataroot, '*.h5'))
@@ -51,8 +52,12 @@ class EventDeblurDataset(Dataset):
         c, h, w = img_gt.shape
         th, tw = self.patch_size, self.patch_size
         if h > th and w > tw:
-            i = random.randint(0, h - th)
-            j = random.randint(0, w - tw)
+            if self.random_crop:
+                i = random.randint(0, h - th)
+                j = random.randint(0, w - tw)
+            else:
+                i = (h - th) // 2
+                j = (w - tw) // 2
             img_blur = img_blur[:, i:i+th, j:j+tw]
             img_gt = img_gt[:, i:i+th, j:j+tw]
             event_tensor = event_tensor[:, i:i+th, j:j+tw]

@@ -78,7 +78,9 @@ def main():
                               num_workers=config['datasets']['train'].get('num_workers', 4),
                               pin_memory=True)
     
-    val_dataset = EventDeblurDataset(opt_dataset=config['datasets']['val'])
+    val_opt = dict(config['datasets']['val'])
+    val_opt['random_crop'] = False
+    val_dataset = EventDeblurDataset(opt_dataset=val_opt)
     val_loader = DataLoader(val_dataset, 
                             batch_size=1, 
                             shuffle=False, 
