@@ -4,3 +4,5 @@ experiments/
 *.pt
 
 __pycache__/
+utils/generate_meeting_figures.py
+TDC_Event_Deblur_Figures/
