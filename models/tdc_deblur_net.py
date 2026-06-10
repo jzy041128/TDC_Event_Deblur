@@ -231,6 +231,66 @@ class WindowCrossAttention2D(nn.Module):
         return self.proj(out)
 
 
+class RGBQEventKVWindowAttention(nn.Module):
+    def __init__(self, channels, window_size=8, num_heads=4):
+        super().__init__()
+        if channels % num_heads != 0:
+            raise ValueError(f'channels ({channels}) must be divisible by num_heads ({num_heads})')
+        self.channels = channels
+        self.window_size = window_size
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.q_img = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        self.k_event = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        self.v_event = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+
+    def partition_windows(self, x):
+        b, c, h, w = x.shape
+        ws = self.window_size
+        pad_h = (ws - h % ws) % ws
+        pad_w = (ws - w % ws) % ws
+        x = F.pad(x, (0, pad_w, 0, pad_h))
+        hp, wp = x.shape[-2:]
+        x = x.view(b, c, hp // ws, ws, wp // ws, ws)
+        x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
+        x = x.view(-1, ws * ws, c)
+        return x, (h, w, hp, wp)
+
+    def reverse_windows(self, x, shape_info, batch_size):
+        h, w, hp, wp = shape_info
+        ws = self.window_size
+        x = x.view(batch_size, hp // ws, wp // ws, ws, ws, self.channels)
+        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+        x = x.view(batch_size, self.channels, hp, wp)
+        return x[:, :, :h, :w]
+
+    def forward(self, img_feat, key_feat, value_feat):
+        q = self.q_img(img_feat)
+        k = self.k_event(key_feat)
+        v = self.v_event(value_feat)
+        b = q.shape[0]
+        q_windows, shape_info = self.partition_windows(q)
+        k_windows, _ = self.partition_windows(k)
+        v_windows, _ = self.partition_windows(v)
+
+        def split_heads(x):
+            x = x.view(x.shape[0], x.shape[1], self.num_heads, self.head_dim)
+            return x.permute(0, 2, 1, 3)
+
+        q_windows = split_heads(q_windows)
+        k_windows = split_heads(k_windows)
+        v_windows = split_heads(v_windows)
+        attn = torch.matmul(q_windows, k_windows.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v_windows)
+        out = out.permute(0, 2, 1, 3).contiguous().view(out.shape[0], -1, self.channels)
+        out = self.reverse_windows(out, shape_info, b)
+        return self.proj(out)
+
+
 class FusionBlock(nn.Module):
     def __init__(self, channels, fusion_op='cat_gate', qkv_mode='rgb_qk_event_v', window_size=8, num_heads=4):
         super().__init__()
@@ -307,6 +367,71 @@ class MultiScaleTDCEventDeblurNet(nn.Module):
         ]
         x = self.up1(fused[2], fused[1])
         x = self.up0(x, fused[0])
+        residual = self.reconstruct(x)
+        return residual + blur
+
+
+class LateFusionTDCEventDeblurNet(nn.Module):
+    def __init__(
+        self,
+        rgb_in=3,
+        event_in=6,
+        base_dim=32,
+        late_fusion_mode='kv_2d_k_tdc_v',
+        window_size=8,
+        num_heads=4,
+    ):
+        super().__init__()
+        self.late_fusion_mode = late_fusion_mode.lower()
+        dims = [base_dim, base_dim * 2, base_dim * 4]
+
+        self.image_encoder = ThreeScaleImageEncoder(rgb_in=rgb_in, base_dim=base_dim)
+        self.event_2d_encoder = EventVoxel2DEncoder(event_in=event_in, base_dim=base_dim)
+        self.event_tdc_encoder = EventTDC3DEncoder(base_dim=base_dim)
+        self.event_merge_h4 = ConvBlock2D(dims[2] * 2, dims[2])
+        self.attn = RGBQEventKVWindowAttention(
+            dims[2],
+            window_size=window_size,
+            num_heads=num_heads,
+        )
+        self.cat_fusion = nn.Sequential(
+            ConvBlock2D(dims[2] * 3, dims[2]),
+            nn.Conv2d(dims[2], dims[2], kernel_size=3, padding=1),
+        )
+        self.inject = nn.Sequential(
+            ConvBlock2D(dims[2], dims[2]),
+            nn.Conv2d(dims[2], dims[2], kernel_size=3, padding=1),
+        )
+        self.up1 = UpBlock(dims[2], dims[1], dims[1])
+        self.up0 = UpBlock(dims[1], dims[0], dims[0])
+        self.reconstruct = nn.Sequential(
+            ConvBlock2D(dims[0], dims[0]),
+            nn.Conv2d(dims[0], rgb_in, kernel_size=3, padding=1),
+        )
+
+    def fuse_h4(self, img_h4, event2d_h4, tdc_h4):
+        if self.late_fusion_mode in ('cat', 'concat'):
+            fusion_delta = self.cat_fusion(torch.cat([img_h4, event2d_h4, tdc_h4], dim=1))
+            return img_h4 + fusion_delta
+        if self.late_fusion_mode in ('kv_2d_k_tdc_v', 'a'):
+            attn_event = self.attn(img_h4, key_feat=event2d_h4, value_feat=tdc_h4)
+        elif self.late_fusion_mode in ('kv_2d_v_tdc_k', 'b'):
+            attn_event = self.attn(img_h4, key_feat=tdc_h4, value_feat=event2d_h4)
+        elif self.late_fusion_mode in ('kv_merged', 'c'):
+            merged_event = self.event_merge_h4(torch.cat([event2d_h4, tdc_h4], dim=1))
+            attn_event = self.attn(img_h4, key_feat=merged_event, value_feat=merged_event)
+        else:
+            raise ValueError(f'Unknown late_fusion_mode: {self.late_fusion_mode}')
+        return img_h4 + self.inject(attn_event)
+
+    def forward(self, blur, event):
+        img_feats = self.image_encoder(blur)
+        event2d_feats = self.event_2d_encoder(event)
+        tdc_feats = self.event_tdc_encoder(event)
+
+        fused_h4 = self.fuse_h4(img_feats[2], event2d_feats[2], tdc_feats[2])
+        x = self.up1(fused_h4, img_feats[1])
+        x = self.up0(x, img_feats[0])
         residual = self.reconstruct(x)
         return residual + blur
 
@@ -410,10 +535,20 @@ def build_deblur_model(
     base_dim=32,
     fusion_type='hybrid',
     qkv_mode='rgb_qk_event_v',
+    late_fusion_mode='kv_2d_k_tdc_v',
     window_size=8,
     num_heads=4,
 ):
     model_type = model_type.lower()
+    if model_type in ('late_fusion', 'late_fusion_tdc', 'single_fusion'):
+        return LateFusionTDCEventDeblurNet(
+            rgb_in=rgb_in,
+            event_in=event_in,
+            base_dim=base_dim,
+            late_fusion_mode=late_fusion_mode,
+            window_size=window_size,
+            num_heads=num_heads,
+        )
     if model_type in ('multiscale', 'multiscale_tdc', 'tdc_multiscale'):
         return MultiScaleTDCEventDeblurNet(
             rgb_in=rgb_in,

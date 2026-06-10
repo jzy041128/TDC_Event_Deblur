@@ -53,18 +53,33 @@ def tensor2float_img(tensor):
     img = np.transpose(img, (1, 2, 0))
     return np.clip(img, 0.0, 1.0)
 
+
+def format_duration(seconds):
+    seconds = int(seconds)
+    hours, rem = divmod(seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
 def main():
     # 1. 加载配置
     with open('configs/train_tdc.yml', 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
-    # 2. 建立带时间戳的实验文件夹 (绝不覆盖旧数据！)
-    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    exp_name = f"{config['name']}_{timestamp}"
-    exp_dir = os.path.join(config['path']['experiments_root'], exp_name)
+    # 2. 建立实验文件夹；恢复训练时继续使用 checkpoint 所在目录
+    resume_path = config['path'].get('resume_state')
+    resume_mode = resume_path and resume_path != '~' and os.path.exists(resume_path)
+    if resume_mode:
+        exp_dir = os.path.dirname(resume_path)
+    else:
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        exp_name = f"{config['name']}_{timestamp}"
+        exp_dir = os.path.join(config['path']['experiments_root'], exp_name)
     os.makedirs(exp_dir, exist_ok=True)
     sys.stdout = Logger(os.path.join(exp_dir, "train_log.txt"))
-    print(f"🚀 本次实验的所有存档将保存在: {exp_dir}")
+    if resume_mode:
+        print(f"🔁 Resume 模式：继续使用原实验目录 {exp_dir}")
+    else:
+        print(f"🚀 本次实验的所有存档将保存在: {exp_dir}")
 
     # 3. 设置设备 (2060 GPU 全开)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -93,6 +108,7 @@ def main():
     base_dim = model_cfg.get('base_dim', 32)
     fusion_type = model_cfg.get('fusion_type', 'hybrid')
     qkv_mode = model_cfg.get('qkv_mode', 'rgb_qk_event_v')
+    late_fusion_mode = model_cfg.get('late_fusion_mode', 'kv_2d_k_tdc_v')
     window_size = model_cfg.get('window_size', 8)
     num_heads = model_cfg.get('num_heads', 4)
     model = build_deblur_model(
@@ -100,12 +116,14 @@ def main():
         base_dim=base_dim,
         fusion_type=fusion_type,
         qkv_mode=qkv_mode,
+        late_fusion_mode=late_fusion_mode,
         window_size=window_size,
         num_heads=num_heads,
     ).to(device)
     print(
         f"Model type: {model_type} | base_dim: {base_dim} | "
         f"fusion_type: {fusion_type} | qkv_mode: {qkv_mode} | "
+        f"late_fusion_mode: {late_fusion_mode} | "
         f"window_size: {window_size} | num_heads: {num_heads}"
     )
     loss_cfg = config.get('loss', {})
@@ -119,12 +137,10 @@ def main():
     # 6. 👇 核心功能：断点续训 (Resume) 👇
     start_epoch = 0
     best_psnr = 0.0
-    resume_path = config['path'].get('resume_state')
-    
     if resume_path and resume_path != '~':
         if os.path.exists(resume_path):
             print(f"🔄 发现存档文件！正在从 {resume_path} 恢复训练...")
-            checkpoint = torch.load(resume_path)
+            checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint['epoch']
@@ -135,8 +151,10 @@ def main():
 
     # 7. 开始训练大循环
     num_epochs = config['train']['num_epochs']
+    train_start_time = time.time()
     
     for epoch in range(start_epoch, num_epochs):
+        epoch_start_time = time.time()
         model.train()
         epoch_loss = 0.0
         
@@ -156,8 +174,8 @@ def main():
             if (step + 1) % 10 == 0:
                 print(f"Epoch [{epoch+1}/{num_epochs}], Step [{step+1}/{len(train_loader)}], Loss: {loss.item():.4f}")
 
-        # --- 验证阶段 (Validation Loop) ---
-        print(f"\n⏳ Epoch {epoch+1} 训练结束，开始在 Test 集上验证...")
+        avg_train_loss = epoch_loss / len(train_loader)
+        print(f"\n⏳ Epoch {epoch+1} 训练结束，平均 Loss: {avg_train_loss:.4f}，开始在 Test 集上验证...")
         model.eval()
         total_blur_psnr, total_pred_psnr, total_ssim = 0.0, 0.0, 0.0
         
@@ -184,6 +202,18 @@ def main():
         avg_ssim = total_ssim / len(val_loader)
         psnr_gain = avg_psnr - avg_blur_psnr
         print(f"📈 验证结果 -> Blur PSNR: {avg_blur_psnr:.2f} dB | Pred PSNR: {avg_psnr:.2f} dB | Gain: {psnr_gain:+.2f} dB | SSIM: {avg_ssim:.4f}\n")
+
+        elapsed_total = time.time() - train_start_time
+        elapsed_epoch = time.time() - epoch_start_time
+        finished_epochs = epoch + 1 - start_epoch
+        remaining_epochs = num_epochs - epoch - 1
+        avg_epoch_time = elapsed_total / max(finished_epochs, 1)
+        eta_seconds = avg_epoch_time * remaining_epochs
+        print(
+            f"⏱️ 时间统计 -> Epoch耗时: {format_duration(elapsed_epoch)} | "
+            f"已用: {format_duration(elapsed_total)} | "
+            f"预计剩余: {format_duration(eta_seconds)}\n"
+        )
 
         # --- 存档阶段 (Save Checkpoints) ---
         save_dict = {

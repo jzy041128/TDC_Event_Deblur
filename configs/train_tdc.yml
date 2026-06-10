@@ -1,19 +1,31 @@
 # ==============================
 # 实验基本信息
 # ==============================
-name: TDC_GoPro_Train
+name: TDC_LateFusion_A_2DKey_TDCValue
 
 # ==============================
 # 模型配置
-# type 可选: multiscale, attention, concat, no_event
-# fusion_type 可选: hybrid, channel_window, window_all, cat_all
-# qkv_mode 可选: rgb_qk_event_v, rgb_q_event_kv, rgb_qk_event_v_gate
+# type 可选:
+#   late_fusion  : 导师新版，只在 H/4 做一次 RGB-Q / Event-KV 融合
+#   multiscale   : 旧版三尺度融合
+#   attention    : 早期单尺度 attention baseline
+#   concat       : 早期单尺度 concat baseline
+#   no_event     : 只用 RGB 的 baseline
+#
+# late_fusion_mode 仅在 type=late_fusion 时生效:
+#   cat             : 对照组，RGB / Event2D / EventTDC 直接 concat 融合
+#   kv_2d_k_tdc_v   : A组，RGB->Q, Event2D->K, EventTDC->V
+#   kv_2d_v_tdc_k   : B组，RGB->Q, EventTDC->K, Event2D->V
+#   kv_merged       : C组，Event2D 和 EventTDC 先合成一路，再共同生成 K/V
+#
+# fusion_type / qkv_mode 仅在旧版 multiscale 时生效。
 # ==============================
 model:
-  type: multiscale
+  type: late_fusion
   base_dim: 24
   fusion_type: hybrid
   qkv_mode: rgb_qk_event_v
+  late_fusion_mode: kv_2d_k_tdc_v
   window_size: 8
   num_heads: 4
 
@@ -26,7 +38,7 @@ loss:
   edge_weight: 0.05
 
 # ==============================
-# 数据集路径配置 (GOPRO 架构)
+# 数据集路径配置
 # ==============================
 datasets:
   train:
@@ -46,7 +58,7 @@ train:
   learning_rate: 0.0002
 
 # ==============================
-# 路径与断点续训 (核心升级！)
+# 路径与断点续训
 # ==============================
 path:
   experiments_root: ./experiments
