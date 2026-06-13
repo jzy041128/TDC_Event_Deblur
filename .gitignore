@@ -5,4 +5,7 @@ experiments/
 
 __pycache__/
 utils/generate_meeting_figures.py
+tools/create_attention_design_doc.py
 TDC_Event_Deblur_Figures/
+tmp_docx_render/
+*.docx

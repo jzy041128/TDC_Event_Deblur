@@ -127,6 +127,28 @@ class EventGate(nn.Module):
         return self.gate(event_feat)
 
 
+class ConvFFN2D(nn.Module):
+    def __init__(self, channels, expansion=2):
+        super().__init__()
+        hidden_channels = channels * expansion
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(
+                hidden_channels,
+                hidden_channels,
+                kernel_size=3,
+                padding=1,
+                groups=hidden_channels,
+            ),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, channels, kernel_size=1),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class ChannelCrossAttention2D(nn.Module):
     def __init__(self, channels, qkv_mode='rgb_qk_event_v'):
         super().__init__()
@@ -384,24 +406,33 @@ class LateFusionTDCEventDeblurNet(nn.Module):
         super().__init__()
         self.late_fusion_mode = late_fusion_mode.lower()
         dims = [base_dim, base_dim * 2, base_dim * 4]
+        h4_dim = dims[2]
 
         self.image_encoder = ThreeScaleImageEncoder(rgb_in=rgb_in, base_dim=base_dim)
         self.event_2d_encoder = EventVoxel2DEncoder(event_in=event_in, base_dim=base_dim)
         self.event_tdc_encoder = EventTDC3DEncoder(base_dim=base_dim)
-        self.event_merge_h4 = ConvBlock2D(dims[2] * 2, dims[2])
+        self.event_merge_h4 = ConvBlock2D(h4_dim * 2, h4_dim)
         self.attn = RGBQEventKVWindowAttention(
-            dims[2],
+            h4_dim,
             window_size=window_size,
             num_heads=num_heads,
         )
         self.cat_fusion = nn.Sequential(
-            ConvBlock2D(dims[2] * 3, dims[2]),
-            nn.Conv2d(dims[2], dims[2], kernel_size=3, padding=1),
+            ConvBlock2D(h4_dim * 3, h4_dim),
+            nn.Conv2d(h4_dim, h4_dim, kernel_size=3, padding=1),
         )
         self.inject = nn.Sequential(
-            ConvBlock2D(dims[2], dims[2]),
-            nn.Conv2d(dims[2], dims[2], kernel_size=3, padding=1),
+            ConvBlock2D(h4_dim, h4_dim),
+            nn.Conv2d(h4_dim, h4_dim, kernel_size=3, padding=1),
         )
+        self.norm_img_h4 = nn.GroupNorm(1, h4_dim)
+        self.norm_event2d_h4 = nn.GroupNorm(1, h4_dim)
+        self.norm_tdc_h4 = nn.GroupNorm(1, h4_dim)
+        self.norm_merged_h4 = nn.GroupNorm(1, h4_dim)
+        self.norm_fused_h4 = nn.GroupNorm(1, h4_dim)
+        self.ffn_h4 = ConvFFN2D(h4_dim)
+        self.gamma_attn = nn.Parameter(torch.ones(1) * 0.1)
+        self.gamma_ffn = nn.Parameter(torch.ones(1) * 0.1)
         self.up1 = UpBlock(dims[2], dims[1], dims[1])
         self.up0 = UpBlock(dims[1], dims[0], dims[0])
         self.reconstruct = nn.Sequential(
@@ -409,19 +440,37 @@ class LateFusionTDCEventDeblurNet(nn.Module):
             nn.Conv2d(dims[0], rgb_in, kernel_size=3, padding=1),
         )
 
+    @staticmethod
+    def _strip_plus_mode(late_fusion_mode):
+        if late_fusion_mode.endswith('_plus'):
+            return late_fusion_mode[:-5], True
+        if late_fusion_mode in ('a_plus', 'b_plus', 'c_plus'):
+            return late_fusion_mode[0], True
+        return late_fusion_mode, False
+
     def fuse_h4(self, img_h4, event2d_h4, tdc_h4):
-        if self.late_fusion_mode in ('cat', 'concat'):
+        base_mode, use_plus = self._strip_plus_mode(self.late_fusion_mode)
+        if base_mode in ('cat', 'concat'):
             fusion_delta = self.cat_fusion(torch.cat([img_h4, event2d_h4, tdc_h4], dim=1))
             return img_h4 + fusion_delta
-        if self.late_fusion_mode in ('kv_2d_k_tdc_v', 'a'):
-            attn_event = self.attn(img_h4, key_feat=event2d_h4, value_feat=tdc_h4)
-        elif self.late_fusion_mode in ('kv_2d_v_tdc_k', 'b'):
-            attn_event = self.attn(img_h4, key_feat=tdc_h4, value_feat=event2d_h4)
-        elif self.late_fusion_mode in ('kv_merged', 'c'):
+        img_for_attn = self.norm_img_h4(img_h4) if use_plus else img_h4
+        event2d_for_attn = self.norm_event2d_h4(event2d_h4) if use_plus else event2d_h4
+        tdc_for_attn = self.norm_tdc_h4(tdc_h4) if use_plus else tdc_h4
+
+        if base_mode in ('kv_2d_k_tdc_v', 'a'):
+            attn_event = self.attn(img_for_attn, key_feat=event2d_for_attn, value_feat=tdc_for_attn)
+        elif base_mode in ('kv_2d_v_tdc_k', 'b'):
+            attn_event = self.attn(img_for_attn, key_feat=tdc_for_attn, value_feat=event2d_for_attn)
+        elif base_mode in ('kv_merged', 'c'):
             merged_event = self.event_merge_h4(torch.cat([event2d_h4, tdc_h4], dim=1))
-            attn_event = self.attn(img_h4, key_feat=merged_event, value_feat=merged_event)
+            if use_plus:
+                merged_event = self.norm_merged_h4(merged_event)
+            attn_event = self.attn(img_for_attn, key_feat=merged_event, value_feat=merged_event)
         else:
             raise ValueError(f'Unknown late_fusion_mode: {self.late_fusion_mode}')
+        if use_plus:
+            fused = img_h4 + self.gamma_attn * self.inject(attn_event)
+            return fused + self.gamma_ffn * self.ffn_h4(self.norm_fused_h4(fused))
         return img_h4 + self.inject(attn_event)
 
     def forward(self, blur, event):

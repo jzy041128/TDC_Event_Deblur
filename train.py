@@ -86,14 +86,19 @@ def main():
     print(f"💻 正在使用设备: {device}")
 
     # 4. 加载数据 (Train 和 Val)
-    train_dataset = EventDeblurDataset(opt_dataset=config['datasets']['train'])
+    train_opt = dict(config['datasets']['train'])
+    train_opt['split'] = '训练集'
+    train_dataset = EventDeblurDataset(opt_dataset=train_opt)
+    train_num_workers = config['datasets']['train'].get('num_workers', 4)
     train_loader = DataLoader(train_dataset, 
                               batch_size=config['datasets']['train']['batch_size'], 
                               shuffle=True, 
-                              num_workers=config['datasets']['train'].get('num_workers', 4),
+                              num_workers=train_num_workers,
+                              persistent_workers=train_num_workers > 0,
                               pin_memory=True)
     
     val_opt = dict(config['datasets']['val'])
+    val_opt['split'] = '测试集'
     val_opt['random_crop'] = False
     val_dataset = EventDeblurDataset(opt_dataset=val_opt)
     val_loader = DataLoader(val_dataset, 
@@ -160,9 +165,9 @@ def main():
         
         # --- 训练阶段 ---
         for step, batch_data in enumerate(train_loader):
-            blur = batch_data['blur'].to(device)
-            event = batch_data['event'].to(device)
-            gt = batch_data['gt'].to(device)
+            blur = batch_data['blur'].to(device, non_blocking=True)
+            event = batch_data['event'].to(device, non_blocking=True)
+            gt = batch_data['gt'].to(device, non_blocking=True)
 
             optimizer.zero_grad()
             pred = model(blur, event)
@@ -181,9 +186,9 @@ def main():
         
         with torch.no_grad():
             for val_batch in val_loader:
-                val_blur = val_batch['blur'].to(device)
-                val_event = val_batch['event'].to(device)
-                val_gt = val_batch['gt'].to(device)
+                val_blur = val_batch['blur'].to(device, non_blocking=True)
+                val_event = val_batch['event'].to(device, non_blocking=True)
+                val_gt = val_batch['gt'].to(device, non_blocking=True)
                 
                 val_pred = model(val_blur, val_event)
                 
