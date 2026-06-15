@@ -146,8 +146,21 @@ def main():
         if os.path.exists(resume_path):
             print(f"🔄 发现存档文件！正在从 {resume_path} 恢复训练...")
             checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            try:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            except RuntimeError as err:
+                print("⚠️ Strict model loading failed; retrying with strict=False for old checkpoints.")
+                print(f"   Reason: {err}")
+                incompatible = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+                if incompatible.missing_keys:
+                    print(f"   Missing new parameters: {incompatible.missing_keys}")
+                if incompatible.unexpected_keys:
+                    print(f"   Unexpected checkpoint parameters: {incompatible.unexpected_keys}")
+            try:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except ValueError as err:
+                print("⚠️ Optimizer state does not match current parameters; optimizer is reinitialized.")
+                print(f"   Reason: {err}")
             start_epoch = checkpoint['epoch']
             best_psnr = checkpoint.get('best_psnr', 0.0)
             print(f"✅ 成功恢复至第 {start_epoch} 个 Epoch！历史最佳 PSNR: {best_psnr:.2f} dB")
