@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import yaml
 import time
@@ -59,6 +60,18 @@ def format_duration(seconds):
     hours, rem = divmod(seconds, 3600)
     minutes, seconds = divmod(rem, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def parse_best_psnr_from_log(log_path):
+    best = 0.0
+    if not os.path.exists(log_path):
+        return best
+    with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            match = re.search(r'Pred PSNR:\s*([0-9.]+)\s*dB', line)
+            if match:
+                best = max(best, float(match.group(1)))
+    return best
 
 def main():
     # 1. 加载配置
@@ -163,6 +176,10 @@ def main():
                 print(f"   Reason: {err}")
             start_epoch = checkpoint['epoch']
             best_psnr = checkpoint.get('best_psnr', 0.0)
+            log_best_psnr = parse_best_psnr_from_log(os.path.join(exp_dir, "train_log.txt"))
+            if log_best_psnr > best_psnr:
+                print(f"ℹ️ 从训练日志恢复更高历史最佳 PSNR: {log_best_psnr:.2f} dB")
+                best_psnr = log_best_psnr
             print(f"✅ 成功恢复至第 {start_epoch} 个 Epoch！历史最佳 PSNR: {best_psnr:.2f} dB")
         else:
             print(f"⚠️ 找不到存档文件 {resume_path}，将从头开始训练！")
@@ -234,6 +251,11 @@ def main():
         )
 
         # --- 存档阶段 (Save Checkpoints) ---
+        is_best = avg_psnr > best_psnr
+        if is_best:
+            best_psnr = avg_psnr
+            print(f"New best model will be saved (PSNR: {best_psnr:.2f})")
+
         save_dict = {
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
@@ -243,6 +265,8 @@ def main():
         
         # 1. 每跑完一个 Epoch，覆盖保存一次 latest.pth (防停电)
         torch.save(save_dict, os.path.join(exp_dir, 'latest.pth'))
+        if is_best:
+            torch.save(save_dict, os.path.join(exp_dir, 'best.pth'))
         
         # 2. 如果分刷出了新高，保存为 best.pth
         if avg_psnr > best_psnr:
