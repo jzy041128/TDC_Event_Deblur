@@ -4,6 +4,7 @@ import h5py
 import numpy as np
 import random
 import glob
+from collections import OrderedDict
 from torch.utils.data import Dataset
 
 class EventDeblurDataset(Dataset):
@@ -13,7 +14,8 @@ class EventDeblurDataset(Dataset):
         self.patch_size = opt_dataset.get('patch_size', 256)
         self.random_crop = opt_dataset.get('random_crop', True)
         self.split = opt_dataset.get('split', '数据集')
-        self.h5_cache = {}
+        self.max_open_h5 = opt_dataset.get('max_open_h5', 2)
+        self.h5_cache = OrderedDict()
         
         # 1. 找到目录下所有的 .h5 文件
         self.h5_files = glob.glob(os.path.join(self.dataroot, '*.h5'))
@@ -36,8 +38,15 @@ class EventDeblurDataset(Dataset):
         return len(self.samples)
 
     def _get_h5_file(self, h5_path):
-        if h5_path not in self.h5_cache:
-            self.h5_cache[h5_path] = h5py.File(h5_path, 'r')
+        if self.max_open_h5 <= 0:
+            return h5py.File(h5_path, 'r')
+        if h5_path in self.h5_cache:
+            self.h5_cache.move_to_end(h5_path)
+            return self.h5_cache[h5_path]
+        while len(self.h5_cache) >= self.max_open_h5:
+            _, old_h5_file = self.h5_cache.popitem(last=False)
+            old_h5_file.close()
+        self.h5_cache[h5_path] = h5py.File(h5_path, 'r')
         return self.h5_cache[h5_path]
 
     def __getstate__(self):
@@ -57,10 +66,14 @@ class EventDeblurDataset(Dataset):
         
         # 3. 按照 EFNet 的键值格式读取数据
         f = self._get_h5_file(h5_path)
-        # 格式化字符串为 9 位数字，如 'image000000001'
-        img_blur = f['images'][f'image{frame_idx:09d}'][...]
-        img_gt = f['sharp_images'][f'image{frame_idx:09d}'][...]
-        event_voxel = f['voxels'][f'voxel{frame_idx:09d}'][...]
+        try:
+            # 格式化字符串为 9 位数字，如 'image000000001'
+            img_blur = f['images'][f'image{frame_idx:09d}'][...]
+            img_gt = f['sharp_images'][f'image{frame_idx:09d}'][...]
+            event_voxel = f['voxels'][f'voxel{frame_idx:09d}'][...]
+        finally:
+            if self.max_open_h5 <= 0:
+                f.close()
         
         # 4. 转换为 Tensor 并归一化图像到 0~1 (原数据已经是 C, H, W 了)
         img_blur = torch.from_numpy(img_blur).float() / 255.0
