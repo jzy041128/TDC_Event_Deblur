@@ -254,7 +254,7 @@ def main():
         is_best = avg_psnr > best_psnr
         if is_best:
             best_psnr = avg_psnr
-            print(f"New best model will be saved (PSNR: {best_psnr:.2f})")
+            print(f"✨ 突破历史记录！正在保存最佳模型 (PSNR: {best_psnr:.2f})")
 
         save_dict = {
             'epoch': epoch + 1,
