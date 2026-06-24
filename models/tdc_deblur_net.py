@@ -457,7 +457,11 @@ class LateFusionTDCEventDeblurNet(nn.Module):
         event2d_for_attn = self.norm_event2d_h4(event2d_h4) if use_plus else event2d_h4
         tdc_for_attn = self.norm_tdc_h4(tdc_h4) if use_plus else tdc_h4
 
-        if base_mode in ('kv_2d_k_tdc_v', 'a'):
+        if base_mode in ('kv_2d_only', 'event2d_only', 'e2d'):
+            attn_event = self.attn(img_for_attn, key_feat=event2d_for_attn, value_feat=event2d_for_attn)
+        elif base_mode in ('kv_tdc_only', 'tdc_only'):
+            attn_event = self.attn(img_for_attn, key_feat=tdc_for_attn, value_feat=tdc_for_attn)
+        elif base_mode in ('kv_2d_k_tdc_v', 'a'):
             attn_event = self.attn(img_for_attn, key_feat=event2d_for_attn, value_feat=tdc_for_attn)
         elif base_mode in ('kv_2d_v_tdc_k', 'b'):
             attn_event = self.attn(img_for_attn, key_feat=tdc_for_attn, value_feat=event2d_for_attn)
