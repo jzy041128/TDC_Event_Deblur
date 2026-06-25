@@ -129,6 +129,7 @@ def main():
     late_fusion_mode = model_cfg.get('late_fusion_mode', 'kv_2d_k_tdc_v')
     window_size = model_cfg.get('window_size', 8)
     num_heads = model_cfg.get('num_heads', 4)
+    qk_norm = model_cfg.get('qk_norm', False)
     model = build_deblur_model(
         model_type=model_type,
         base_dim=base_dim,
@@ -137,12 +138,13 @@ def main():
         late_fusion_mode=late_fusion_mode,
         window_size=window_size,
         num_heads=num_heads,
+        qk_norm=qk_norm,
     ).to(device)
     print(
         f"Model type: {model_type} | base_dim: {base_dim} | "
         f"fusion_type: {fusion_type} | qkv_mode: {qkv_mode} | "
         f"late_fusion_mode: {late_fusion_mode} | "
-        f"window_size: {window_size} | num_heads: {num_heads}"
+        f"window_size: {window_size} | num_heads: {num_heads} | qk_norm: {qk_norm}"
     )
     loss_cfg = config.get('loss', {})
     criterion = build_loss(

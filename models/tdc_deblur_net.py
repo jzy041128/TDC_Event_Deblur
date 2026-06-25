@@ -254,7 +254,7 @@ class WindowCrossAttention2D(nn.Module):
 
 
 class RGBQEventKVWindowAttention(nn.Module):
-    def __init__(self, channels, window_size=8, num_heads=4):
+    def __init__(self, channels, window_size=8, num_heads=4, qk_norm=False):
         super().__init__()
         if channels % num_heads != 0:
             raise ValueError(f'channels ({channels}) must be divisible by num_heads ({num_heads})')
@@ -263,6 +263,7 @@ class RGBQEventKVWindowAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = channels // num_heads
         self.scale = self.head_dim ** -0.5
+        self.qk_norm = qk_norm
 
         self.q_img = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
         self.k_event = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
@@ -305,6 +306,9 @@ class RGBQEventKVWindowAttention(nn.Module):
         q_windows = split_heads(q_windows)
         k_windows = split_heads(k_windows)
         v_windows = split_heads(v_windows)
+        if self.qk_norm:
+            q_windows = F.normalize(q_windows, dim=-1)
+            k_windows = F.normalize(k_windows, dim=-1)
         attn = torch.matmul(q_windows, k_windows.transpose(-2, -1)) * self.scale
         attn = F.softmax(attn, dim=-1)
         out = torch.matmul(attn, v_windows)
@@ -402,6 +406,7 @@ class LateFusionTDCEventDeblurNet(nn.Module):
         late_fusion_mode='kv_2d_k_tdc_v',
         window_size=8,
         num_heads=4,
+        qk_norm=False,
     ):
         super().__init__()
         self.late_fusion_mode = late_fusion_mode.lower()
@@ -416,6 +421,7 @@ class LateFusionTDCEventDeblurNet(nn.Module):
             h4_dim,
             window_size=window_size,
             num_heads=num_heads,
+            qk_norm=qk_norm,
         )
         self.cat_fusion = nn.Sequential(
             ConvBlock2D(h4_dim * 3, h4_dim),
@@ -591,6 +597,7 @@ def build_deblur_model(
     late_fusion_mode='kv_2d_k_tdc_v',
     window_size=8,
     num_heads=4,
+    qk_norm=False,
 ):
     model_type = model_type.lower()
     if model_type in ('late_fusion', 'late_fusion_tdc', 'single_fusion'):
@@ -601,6 +608,7 @@ def build_deblur_model(
             late_fusion_mode=late_fusion_mode,
             window_size=window_size,
             num_heads=num_heads,
+            qk_norm=qk_norm,
         )
     if model_type in ('multiscale', 'multiscale_tdc', 'tdc_multiscale'):
         return MultiScaleTDCEventDeblurNet(

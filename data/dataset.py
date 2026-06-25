@@ -15,6 +15,7 @@ class EventDeblurDataset(Dataset):
         self.random_crop = opt_dataset.get('random_crop', True)
         self.split = opt_dataset.get('split', '数据集')
         self.max_open_h5 = opt_dataset.get('max_open_h5', 2)
+        self.norm_event = opt_dataset.get('norm_event', False)
         self.h5_cache = OrderedDict()
         
         # 1. 找到目录下所有的 .h5 文件
@@ -79,6 +80,9 @@ class EventDeblurDataset(Dataset):
         img_blur = torch.from_numpy(img_blur).float() / 255.0
         img_gt = torch.from_numpy(img_gt).float() / 255.0
         event_tensor = torch.from_numpy(event_voxel).float()
+        if self.norm_event:
+            event_scale = event_tensor.abs().amax()
+            event_tensor = event_tensor / (event_scale + 1e-6)
         
         # 5. 随机裁剪 (保证图像和事件流裁剪同一块区域)
         c, h, w = img_gt.shape
