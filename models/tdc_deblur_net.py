@@ -106,7 +106,7 @@ class EventVoxel3DEncoder(nn.Module):
         feats_2d = [self.pool_time(feat) for feat in feats_3d]
         if return_3d:
             return feats_2d, feats_3d
-        return feats_2d
+        return feats_2d, None
 
 
 class EventTDC3DEncoder(nn.Module):
@@ -157,11 +157,13 @@ class EventEncoderWith3DOption(nn.Module):
 
     def forward(self, event, return_3d=False):
         if self.encoder_type == '3d':
-            return self.encoder(event, return_3d=return_3d)
+            if return_3d:
+                return self.encoder(event, return_3d=True)
+            return self.encoder(event, return_3d=False), None
         feats_2d = self.encoder(event)
         if return_3d:
             return feats_2d, None
-        return feats_2d
+        return feats_2d, None
 
 
 class DualEventEncoder(nn.Module):
