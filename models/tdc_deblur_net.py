@@ -65,6 +65,50 @@ class EventVoxel2DEncoder(nn.Module):
         return [feat0, feat1, feat2]
 
 
+class EventVoxel3DEncoder(nn.Module):
+    def __init__(self, base_dim=32):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv3d(1, base_dim, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
+            nn.BatchNorm3d(base_dim),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv3d(base_dim, base_dim, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
+            nn.BatchNorm3d(base_dim),
+            nn.LeakyReLU(0.2, True),
+        )
+        self.down1 = nn.Sequential(
+            nn.Conv3d(base_dim, base_dim * 2, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
+            nn.BatchNorm3d(base_dim * 2),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv3d(base_dim * 2, base_dim * 2, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)),
+            nn.BatchNorm3d(base_dim * 2),
+            nn.LeakyReLU(0.2, True),
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv3d(base_dim * 2, base_dim * 4, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
+            nn.BatchNorm3d(base_dim * 4),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv3d(base_dim * 4, base_dim * 4, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)),
+            nn.BatchNorm3d(base_dim * 4),
+            nn.LeakyReLU(0.2, True),
+        )
+
+    @staticmethod
+    def pool_time(x):
+        return x.mean(dim=2)
+
+    def forward(self, event, return_3d=False):
+        x = event.unsqueeze(1)
+        feat0_3d = self.stem(x)
+        feat1_3d = self.down1(feat0_3d)
+        feat2_3d = self.down2(feat1_3d)
+        feats_3d = [feat0_3d, feat1_3d, feat2_3d]
+        feats_2d = [self.pool_time(feat) for feat in feats_3d]
+        if return_3d:
+            return feats_2d, feats_3d
+        return feats_2d
+
+
 class EventTDC3DEncoder(nn.Module):
     def __init__(self, base_dim=32):
         super().__init__()
@@ -88,12 +132,36 @@ class EventTDC3DEncoder(nn.Module):
     def pool_time(x):
         return x.mean(dim=2)
 
-    def forward(self, event):
+    def forward(self, event, return_3d=False):
         x = event.unsqueeze(1)
         feat0_3d = self.stem(x)
         feat1_3d = self.down1(feat0_3d)
         feat2_3d = self.down2(feat1_3d)
-        return [self.pool_time(feat0_3d), self.pool_time(feat1_3d), self.pool_time(feat2_3d)]
+        feats_3d = [feat0_3d, feat1_3d, feat2_3d]
+        feats_2d = [self.pool_time(feat) for feat in feats_3d]
+        if return_3d:
+            return feats_2d, feats_3d
+        return feats_2d
+
+
+class EventEncoderWith3DOption(nn.Module):
+    def __init__(self, event_in=6, base_dim=32, encoder_type='2d'):
+        super().__init__()
+        self.encoder_type = encoder_type.lower()
+        if self.encoder_type == '2d':
+            self.encoder = EventVoxel2DEncoder(event_in=event_in, base_dim=base_dim)
+        elif self.encoder_type == '3d':
+            self.encoder = EventVoxel3DEncoder(base_dim=base_dim)
+        else:
+            raise ValueError(f'Unknown event_encoder_type: {encoder_type}')
+
+    def forward(self, event, return_3d=False):
+        if self.encoder_type == '3d':
+            return self.encoder(event, return_3d=return_3d)
+        feats_2d = self.encoder(event)
+        if return_3d:
+            return feats_2d, None
+        return feats_2d
 
 
 class DualEventEncoder(nn.Module):
@@ -317,6 +385,75 @@ class RGBQEventKVWindowAttention(nn.Module):
         return self.proj(out)
 
 
+class RGBQEventKVWindowAttention3D(nn.Module):
+    def __init__(self, channels, window_size=8, temporal_window=2, num_heads=4, qk_norm=False):
+        super().__init__()
+        if channels % num_heads != 0:
+            raise ValueError(f'channels ({channels}) must be divisible by num_heads ({num_heads})')
+        self.channels = channels
+        self.window_size = window_size
+        self.temporal_window = temporal_window
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qk_norm = qk_norm
+
+        self.q_img = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+        self.k_event = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
+        self.v_event = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
+
+    def partition_windows(self, x):
+        b, c, t, h, w = x.shape
+        wt = min(self.temporal_window, t)
+        ws = self.window_size
+        pad_t = (wt - t % wt) % wt
+        pad_h = (ws - h % ws) % ws
+        pad_w = (ws - w % ws) % ws
+        x = F.pad(x, (0, pad_w, 0, pad_h, 0, pad_t))
+        tp, hp, wp = x.shape[-3:]
+        x = x.view(b, c, tp // wt, wt, hp // ws, ws, wp // ws, ws)
+        x = x.permute(0, 2, 4, 6, 3, 5, 7, 1).contiguous()
+        x = x.view(-1, wt * ws * ws, c)
+        return x, (t, h, w, tp, hp, wp, wt, ws)
+
+    def reverse_windows(self, x, shape_info, batch_size):
+        t, h, w, tp, hp, wp, wt, ws = shape_info
+        x = x.view(batch_size, tp // wt, hp // ws, wp // ws, wt, ws, ws, self.channels)
+        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
+        x = x.view(batch_size, self.channels, tp, hp, wp)
+        return x[:, :, :t, :h, :w]
+
+    def forward(self, img_feat, key_feat_3d, value_feat_3d):
+        q_2d = self.q_img(img_feat)
+        k = self.k_event(key_feat_3d)
+        v = self.v_event(value_feat_3d)
+        b, _, t, _, _ = k.shape
+        q = q_2d.unsqueeze(2).expand(-1, -1, t, -1, -1)
+
+        q_windows, shape_info = self.partition_windows(q)
+        k_windows, _ = self.partition_windows(k)
+        v_windows, _ = self.partition_windows(v)
+
+        def split_heads(x):
+            x = x.view(x.shape[0], x.shape[1], self.num_heads, self.head_dim)
+            return x.permute(0, 2, 1, 3)
+
+        q_windows = split_heads(q_windows)
+        k_windows = split_heads(k_windows)
+        v_windows = split_heads(v_windows)
+        if self.qk_norm:
+            q_windows = F.normalize(q_windows, dim=-1)
+            k_windows = F.normalize(k_windows, dim=-1)
+        attn = torch.matmul(q_windows, k_windows.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v_windows)
+        out = out.permute(0, 2, 1, 3).contiguous().view(out.shape[0], -1, self.channels)
+        out = self.reverse_windows(out, shape_info, b)
+        out = out.mean(dim=2)
+        return self.proj(out)
+
+
 class FusionBlock(nn.Module):
     def __init__(self, channels, fusion_op='cat_gate', qkv_mode='rgb_qk_event_v', window_size=8, num_heads=4):
         super().__init__()
@@ -407,19 +544,35 @@ class LateFusionTDCEventDeblurNet(nn.Module):
         window_size=8,
         num_heads=4,
         qk_norm=False,
+        event_encoder_type='2d',
+        attention_dim='2d',
+        temporal_window=2,
     ):
         super().__init__()
         self.late_fusion_mode = late_fusion_mode.lower()
+        self.event_encoder_type = event_encoder_type.lower()
+        self.attention_dim = attention_dim.lower()
         dims = [base_dim, base_dim * 2, base_dim * 4]
         h4_dim = dims[2]
 
         self.image_encoder = ThreeScaleImageEncoder(rgb_in=rgb_in, base_dim=base_dim)
-        self.event_2d_encoder = EventVoxel2DEncoder(event_in=event_in, base_dim=base_dim)
+        self.event_2d_encoder = EventEncoderWith3DOption(
+            event_in=event_in,
+            base_dim=base_dim,
+            encoder_type=event_encoder_type,
+        )
         self.event_tdc_encoder = EventTDC3DEncoder(base_dim=base_dim)
         self.event_merge_h4 = ConvBlock2D(h4_dim * 2, h4_dim)
         self.attn = RGBQEventKVWindowAttention(
             h4_dim,
             window_size=window_size,
+            num_heads=num_heads,
+            qk_norm=qk_norm,
+        )
+        self.attn3d = RGBQEventKVWindowAttention3D(
+            h4_dim,
+            window_size=window_size,
+            temporal_window=temporal_window,
             num_heads=num_heads,
             qk_norm=qk_norm,
         )
@@ -454,7 +607,7 @@ class LateFusionTDCEventDeblurNet(nn.Module):
             return late_fusion_mode[0], True
         return late_fusion_mode, False
 
-    def fuse_h4(self, img_h4, event2d_h4, tdc_h4):
+    def fuse_h4(self, img_h4, event2d_h4, tdc_h4, event3d_h4=None, tdc3d_h4=None):
         base_mode, use_plus = self._strip_plus_mode(self.late_fusion_mode)
         if base_mode in ('cat', 'concat'):
             fusion_delta = self.cat_fusion(torch.cat([img_h4, event2d_h4, tdc_h4], dim=1))
@@ -462,8 +615,21 @@ class LateFusionTDCEventDeblurNet(nn.Module):
         img_for_attn = self.norm_img_h4(img_h4) if use_plus else img_h4
         event2d_for_attn = self.norm_event2d_h4(event2d_h4) if use_plus else event2d_h4
         tdc_for_attn = self.norm_tdc_h4(tdc_h4) if use_plus else tdc_h4
+        event3d_for_attn = self.norm_event2d_h4(event3d_h4) if use_plus and event3d_h4 is not None else event3d_h4
+        tdc3d_for_attn = self.norm_tdc_h4(tdc3d_h4) if use_plus and tdc3d_h4 is not None else tdc3d_h4
 
-        if base_mode in ('kv_2d_only', 'event2d_only', 'e2d'):
+        if self.attention_dim == '3d':
+            if event3d_for_attn is None or tdc3d_for_attn is None:
+                raise ValueError('attention_dim=3d requires event_encoder_type=3d and 3D TDC features.')
+            if base_mode in ('kv_2d_k_tdc_v', 'a'):
+                attn_event = self.attn3d(img_for_attn, key_feat_3d=event3d_for_attn, value_feat_3d=tdc3d_for_attn)
+            elif base_mode in ('kv_2d_only', 'event2d_only', 'e2d'):
+                attn_event = self.attn3d(img_for_attn, key_feat_3d=event3d_for_attn, value_feat_3d=event3d_for_attn)
+            elif base_mode in ('kv_tdc_only', 'tdc_only'):
+                attn_event = self.attn3d(img_for_attn, key_feat_3d=tdc3d_for_attn, value_feat_3d=tdc3d_for_attn)
+            else:
+                raise ValueError(f'attention_dim=3d currently supports A/event2d_only/tdc_only, got: {self.late_fusion_mode}')
+        elif base_mode in ('kv_2d_only', 'event2d_only', 'e2d'):
             attn_event = self.attn(img_for_attn, key_feat=event2d_for_attn, value_feat=event2d_for_attn)
         elif base_mode in ('kv_tdc_only', 'tdc_only'):
             attn_event = self.attn(img_for_attn, key_feat=tdc_for_attn, value_feat=tdc_for_attn)
@@ -485,10 +651,13 @@ class LateFusionTDCEventDeblurNet(nn.Module):
 
     def forward(self, blur, event):
         img_feats = self.image_encoder(blur)
-        event2d_feats = self.event_2d_encoder(event)
-        tdc_feats = self.event_tdc_encoder(event)
+        need_3d = self.attention_dim == '3d'
+        event2d_feats, event3d_feats = self.event_2d_encoder(event, return_3d=need_3d)
+        tdc_feats, tdc3d_feats = self.event_tdc_encoder(event, return_3d=need_3d)
 
-        fused_h4 = self.fuse_h4(img_feats[2], event2d_feats[2], tdc_feats[2])
+        event3d_h4 = event3d_feats[2] if event3d_feats is not None else None
+        tdc3d_h4 = tdc3d_feats[2] if tdc3d_feats is not None else None
+        fused_h4 = self.fuse_h4(img_feats[2], event2d_feats[2], tdc_feats[2], event3d_h4, tdc3d_h4)
         x = self.up1(fused_h4, img_feats[1])
         x = self.up0(x, img_feats[0])
         residual = self.reconstruct(x)
@@ -598,6 +767,9 @@ def build_deblur_model(
     window_size=8,
     num_heads=4,
     qk_norm=False,
+    event_encoder_type='2d',
+    attention_dim='2d',
+    temporal_window=2,
 ):
     model_type = model_type.lower()
     if model_type in ('late_fusion', 'late_fusion_tdc', 'single_fusion'):
@@ -609,6 +781,9 @@ def build_deblur_model(
             window_size=window_size,
             num_heads=num_heads,
             qk_norm=qk_norm,
+            event_encoder_type=event_encoder_type,
+            attention_dim=attention_dim,
+            temporal_window=temporal_window,
         )
     if model_type in ('multiscale', 'multiscale_tdc', 'tdc_multiscale'):
         return MultiScaleTDCEventDeblurNet(

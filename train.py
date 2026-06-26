@@ -96,6 +96,8 @@ def main():
 
     # 3. 设置设备 (2060 GPU 全开)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        torch.backends.cudnn.benchmark = True
     print(f"💻 正在使用设备: {device}")
 
     # 4. 加载数据 (Train 和 Val)
@@ -103,12 +105,16 @@ def main():
     train_opt['split'] = '训练集'
     train_dataset = EventDeblurDataset(opt_dataset=train_opt)
     train_num_workers = config['datasets']['train'].get('num_workers', 4)
-    train_loader = DataLoader(train_dataset, 
-                              batch_size=config['datasets']['train']['batch_size'], 
-                              shuffle=True, 
-                              num_workers=train_num_workers,
-                              persistent_workers=train_num_workers > 0,
-                              pin_memory=True)
+    train_loader_kwargs = {
+        'batch_size': config['datasets']['train']['batch_size'],
+        'shuffle': True,
+        'num_workers': train_num_workers,
+        'persistent_workers': train_num_workers > 0,
+        'pin_memory': True,
+    }
+    if train_num_workers > 0:
+        train_loader_kwargs['prefetch_factor'] = config['datasets']['train'].get('prefetch_factor', 4)
+    train_loader = DataLoader(train_dataset, **train_loader_kwargs)
     
     val_opt = dict(config['datasets']['val'])
     val_opt['split'] = '测试集'
@@ -130,6 +136,9 @@ def main():
     window_size = model_cfg.get('window_size', 8)
     num_heads = model_cfg.get('num_heads', 4)
     qk_norm = model_cfg.get('qk_norm', False)
+    event_encoder_type = model_cfg.get('event_encoder_type', '2d')
+    attention_dim = model_cfg.get('attention_dim', '2d')
+    temporal_window = model_cfg.get('temporal_window', 2)
     model = build_deblur_model(
         model_type=model_type,
         base_dim=base_dim,
@@ -139,12 +148,17 @@ def main():
         window_size=window_size,
         num_heads=num_heads,
         qk_norm=qk_norm,
+        event_encoder_type=event_encoder_type,
+        attention_dim=attention_dim,
+        temporal_window=temporal_window,
     ).to(device)
     print(
         f"Model type: {model_type} | base_dim: {base_dim} | "
         f"fusion_type: {fusion_type} | qkv_mode: {qkv_mode} | "
         f"late_fusion_mode: {late_fusion_mode} | "
-        f"window_size: {window_size} | num_heads: {num_heads} | qk_norm: {qk_norm}"
+        f"window_size: {window_size} | num_heads: {num_heads} | qk_norm: {qk_norm} | "
+        f"event_encoder_type: {event_encoder_type} | attention_dim: {attention_dim} | "
+        f"temporal_window: {temporal_window}"
     )
     loss_cfg = config.get('loss', {})
     criterion = build_loss(
@@ -193,7 +207,7 @@ def main():
     for epoch in range(start_epoch, num_epochs):
         epoch_start_time = time.time()
         model.train()
-        epoch_loss = 0.0
+        epoch_loss = torch.zeros((), device=device)
         
         # --- 训练阶段 ---
         for step, batch_data in enumerate(train_loader):
@@ -201,17 +215,18 @@ def main():
             event = batch_data['event'].to(device, non_blocking=True)
             gt = batch_data['gt'].to(device, non_blocking=True)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             pred = model(blur, event)
             loss = criterion(pred, gt)
             loss.backward()
             optimizer.step()
 
-            epoch_loss += loss.item()
+            epoch_loss += loss.detach()
             if (step + 1) % 10 == 0:
-                print(f"Epoch [{epoch+1}/{num_epochs}], Step [{step+1}/{len(train_loader)}], Loss: {loss.item():.4f}")
+                current_loss = loss.detach().item()
+                print(f"Epoch [{epoch+1}/{num_epochs}], Step [{step+1}/{len(train_loader)}], Loss: {current_loss:.4f}")
 
-        avg_train_loss = epoch_loss / len(train_loader)
+        avg_train_loss = (epoch_loss / len(train_loader)).item()
         print(f"\n⏳ Epoch {epoch+1} 训练结束，平均 Loss: {avg_train_loss:.4f}，开始在 Test 集上验证...")
         model.eval()
         total_blur_psnr, total_pred_psnr, total_ssim = 0.0, 0.0, 0.0

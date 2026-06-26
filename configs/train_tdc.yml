@@ -1,7 +1,7 @@
 # ==============================
 # 实验基本信息
 # ==============================
-name: TDC_LateFusion_A_2DKey_TDCValue
+name: TDC_LateFusion_Aplus_EventNorm_30ep
 
 # ==============================
 # 模型配置
@@ -22,12 +22,16 @@ name: TDC_LateFusion_A_2DKey_TDCValue
 # ==============================
 model:
   type: late_fusion
-  base_dim: 24
+  base_dim: 32
   fusion_type: hybrid
   qkv_mode: rgb_qk_event_v
-  late_fusion_mode: kv_2d_k_tdc_v
+  late_fusion_mode: kv_2d_k_tdc_v_plus
   window_size: 8
   num_heads: 4
+  qk_norm: false
+  event_encoder_type: 2d
+  attention_dim: 2d
+  temporal_window: 2
 
 # ==============================
 # 损失函数配置
@@ -43,18 +47,23 @@ loss:
 datasets:
   train:
     dataroot: E:/GOPRO/GOPRO/train
-    patch_size: 128
-    batch_size: 1
+    patch_size: 256
+    batch_size: 4
     num_workers: 2
+    prefetch_factor: 4
+    max_open_h5: 2
+    norm_event: true
   val:
     dataroot: E:/GOPRO/GOPRO/test
-    patch_size: 128
+    patch_size: 256
+    max_open_h5: 2
+    norm_event: true
 
 # ==============================
 # 训练参数
 # ==============================
 train:
-  num_epochs: 100
+  num_epochs: 30
   learning_rate: 0.0002
 
 # ==============================
