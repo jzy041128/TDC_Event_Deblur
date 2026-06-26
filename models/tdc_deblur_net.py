@@ -141,7 +141,7 @@ class EventTDC3DEncoder(nn.Module):
         feats_2d = [self.pool_time(feat) for feat in feats_3d]
         if return_3d:
             return feats_2d, feats_3d
-        return feats_2d
+        return feats_2d, None
 
 
 class EventEncoderWith3DOption(nn.Module):
@@ -178,7 +178,7 @@ class DualEventEncoder(nn.Module):
 
     def forward(self, event):
         voxel_feats = self.voxel_2d(event)
-        temporal_feats = self.tdc_3d(event)
+        temporal_feats, _ = self.tdc_3d(event)
         return [
             merge(torch.cat([voxel, temporal], dim=1))
             for merge, voxel, temporal in zip(self.merge, voxel_feats, temporal_feats)
