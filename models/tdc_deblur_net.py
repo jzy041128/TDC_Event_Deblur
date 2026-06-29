@@ -157,9 +157,7 @@ class EventEncoderWith3DOption(nn.Module):
 
     def forward(self, event, return_3d=False):
         if self.encoder_type == '3d':
-            if return_3d:
-                return self.encoder(event, return_3d=True)
-            return self.encoder(event, return_3d=False), None
+            return self.encoder(event, return_3d=return_3d)
         feats_2d = self.encoder(event)
         if return_3d:
             return feats_2d, None
