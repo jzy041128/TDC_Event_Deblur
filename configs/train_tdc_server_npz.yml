@@ -1,0 +1,48 @@
+name: TDC_LateFusion_Aplus_ServerNPZ_Smoke
+
+model:
+  type: late_fusion
+  base_dim: 32
+  fusion_type: hybrid
+  qkv_mode: rgb_qk_event_v
+  late_fusion_mode: kv_2d_k_tdc_v_plus
+  window_size: 8
+  num_heads: 4
+  qk_norm: false
+  event_encoder_type: 2d
+  attention_dim: 2d
+  temporal_window: 2
+
+loss:
+  type: l1
+  edge_weight: 0.05
+
+datasets:
+  train:
+    dataset_type: server_npz
+    blur_root: /data1/YW/DVS_DATA/npz/train/blur
+    gt_root: /data1/YW/DVS_DATA/npz/train/gt
+    event_root: /data1/YW/DVS_DATA/npz/train/event_0.1_0.1
+    event_ext: .npz
+    event_bins: 6
+    patch_size: 256
+    batch_size: 1
+    num_workers: 0
+    norm_event: true
+  val:
+    dataset_type: server_npz
+    blur_root: /data1/YW/DVS_DATA/npz/test/blur
+    gt_root: /data1/YW/DVS_DATA/npz/test/gt
+    event_root: /data1/YW/DVS_DATA/npz/test/event_0.1_0.1
+    event_ext: .npz
+    event_bins: 6
+    patch_size: 256
+    norm_event: true
+
+train:
+  num_epochs: 1
+  learning_rate: 0.0002
+
+path:
+  experiments_root: /data1/jzy/experiments
+  resume_state: ~

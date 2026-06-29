@@ -1,4 +1,5 @@
 import os
+import argparse
 import re
 import sys
 import yaml
@@ -14,7 +15,7 @@ import numpy as np
 from skimage.metrics import peak_signal_noise_ratio as calculate_psnr
 from skimage.metrics import structural_similarity as calculate_ssim
 
-from data.dataset import EventDeblurDataset
+from data.dataset import build_dataset
 from models.losses import build_loss
 from models.tdc_deblur_net import build_deblur_model
 
@@ -73,9 +74,19 @@ def parse_best_psnr_from_log(log_path):
                 best = max(best, float(match.group(1)))
     return best
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        default="configs/train_tdc.yml",
+        help="Path to a YAML training config.",
+    )
+    return parser.parse_args()
+
 def main():
     # 1. 加载配置
-    with open('configs/train_tdc.yml', 'r', encoding='utf-8') as f:
+    args = parse_args()
+    with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
     # 2. 建立实验文件夹；恢复训练时继续使用 checkpoint 所在目录
@@ -103,7 +114,7 @@ def main():
     # 4. 加载数据 (Train 和 Val)
     train_opt = dict(config['datasets']['train'])
     train_opt['split'] = '训练集'
-    train_dataset = EventDeblurDataset(opt_dataset=train_opt)
+    train_dataset = build_dataset(train_opt)
     train_num_workers = config['datasets']['train'].get('num_workers', 4)
     train_loader_kwargs = {
         'batch_size': config['datasets']['train']['batch_size'],
@@ -119,7 +130,7 @@ def main():
     val_opt = dict(config['datasets']['val'])
     val_opt['split'] = '测试集'
     val_opt['random_crop'] = False
-    val_dataset = EventDeblurDataset(opt_dataset=val_opt)
+    val_dataset = build_dataset(val_opt)
     val_loader = DataLoader(val_dataset, 
                             batch_size=1, 
                             shuffle=False, 
