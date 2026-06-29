@@ -1,11 +1,11 @@
-name: TDC_LateFusion_Aplus_ServerVoxel_Smoke
+name: TDC_Multiscale_CatAll_ServerVoxel_DDP_30ep
 
 model:
-  type: late_fusion
+  type: multiscale
   base_dim: 32
-  fusion_type: hybrid
+  fusion_type: cat_all
   qkv_mode: rgb_qk_event_v
-  late_fusion_mode: kv_2d_k_tdc_v_plus
+  late_fusion_mode: cat
   window_size: 8
   num_heads: 4
   qk_norm: false
@@ -27,7 +27,8 @@ datasets:
     event_bins: 6
     patch_size: 256
     batch_size: 1
-    num_workers: 0
+    num_workers: 4
+    prefetch_factor: 2
     norm_event: true
   val:
     dataset_type: server_voxel
@@ -40,10 +41,9 @@ datasets:
     norm_event: true
 
 train:
-  num_epochs: 1
+  num_epochs: 30
   learning_rate: 0.0002
 
 path:
   experiments_root: /data1/jzy/experiments
   resume_state: ~
-#conda activate tdc_deblur
