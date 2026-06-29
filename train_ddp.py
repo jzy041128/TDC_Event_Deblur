@@ -168,7 +168,12 @@ def build_model(config, device):
         attention_dim=model_cfg.get("attention_dim", "2d"),
         temporal_window=model_cfg.get("temporal_window", 2),
     ).to(device)
-    return DDP(model, device_ids=[device.index], output_device=device.index)
+    return DDP(
+        model,
+        device_ids=[device.index],
+        output_device=device.index,
+        find_unused_parameters=True,
+    )
 
 
 def validate(model, val_loader, device):
@@ -207,7 +212,11 @@ def main():
 
     resume_path = config["path"].get("resume_state")
     exp_dir, resume_mode = make_experiment_dir(config, resume_path)
-    sys.stdout = Logger(os.path.join(exp_dir, "train_log.txt")) if rank0() else NullWriter()
+    if rank0():
+        sys.stdout = Logger(os.path.join(exp_dir, "train_log.txt"))
+        sys.stderr = sys.stdout
+    else:
+        sys.stdout = NullWriter()
     print(f"Experiment dir: {exp_dir}")
     print(f"Device: {device} | DDP world_size: {world_size} | per_gpu_batch: {config['datasets']['train']['batch_size']}")
 
@@ -250,7 +259,9 @@ def main():
         epoch_start_time = time.time()
         model.train()
         epoch_loss = torch.zeros((), device=device)
+        steps_this_epoch = 0
 
+        max_train_steps = config["train"].get("max_train_steps")
         for step, batch_data in enumerate(train_loader):
             blur = batch_data["blur"].to(device, non_blocking=True)
             event = batch_data["event"].to(device, non_blocking=True)
@@ -263,17 +274,24 @@ def main():
             optimizer.step()
 
             epoch_loss += loss.detach()
+            steps_this_epoch += 1
             if rank0() and (step + 1) % 10 == 0:
                 print(f"Epoch [{epoch+1}/{num_epochs}], Step [{step+1}/{len(train_loader)}], Loss: {loss.detach().item():.4f}")
+            if max_train_steps is not None and step + 1 >= max_train_steps:
+                break
 
         dist.all_reduce(epoch_loss, op=dist.ReduceOp.SUM)
-        avg_train_loss = (epoch_loss / (len(train_loader) * world_size)).item()
+        avg_train_loss = (epoch_loss / (max(steps_this_epoch, 1) * world_size)).item()
         avg_psnr = 0.0
         if rank0():
-            print(f"\nEpoch {epoch+1} train done, avg loss: {avg_train_loss:.4f}. Validating...")
-            avg_blur_psnr, avg_psnr, avg_ssim = validate(model, val_loader, device)
-            psnr_gain = avg_psnr - avg_blur_psnr
-            print(f"Val -> Blur PSNR: {avg_blur_psnr:.2f} dB | Pred PSNR: {avg_psnr:.2f} dB | Gain: {psnr_gain:+.2f} dB | SSIM: {avg_ssim:.4f}\n")
+            skip_validation = config["train"].get("skip_validation", False)
+            if skip_validation:
+                print(f"\nEpoch {epoch+1} train done, avg loss: {avg_train_loss:.4f}. Validation skipped.")
+            else:
+                print(f"\nEpoch {epoch+1} train done, avg loss: {avg_train_loss:.4f}. Validating...")
+                avg_blur_psnr, avg_psnr, avg_ssim = validate(model, val_loader, device)
+                psnr_gain = avg_psnr - avg_blur_psnr
+                print(f"Val -> Blur PSNR: {avg_blur_psnr:.2f} dB | Pred PSNR: {avg_psnr:.2f} dB | Gain: {psnr_gain:+.2f} dB | SSIM: {avg_ssim:.4f}\n")
 
             elapsed_total = time.time() - train_start_time
             elapsed_epoch = time.time() - epoch_start_time
@@ -285,7 +303,7 @@ def main():
                 f"Elapsed: {format_duration(elapsed_total)} | ETA: {format_duration(eta_seconds)}\n"
             )
 
-            is_best = avg_psnr > best_psnr
+            is_best = (not skip_validation) and avg_psnr > best_psnr
             if is_best:
                 best_psnr = avg_psnr
                 print(f"New best model, PSNR: {best_psnr:.2f}")
