@@ -20,8 +20,8 @@ loss:
 datasets:
   train:
     dataset_type: server_voxel
-    blur_root: /data1/YW/DVS_DATA/npz/train/blur
-    gt_root: /data1/YW/DVS_DATA/npz/train/gt
+    blur_root: /data1/YW/DVS_DATA/voxel_grid/train/blur
+    gt_root: /data1/YW/DVS_DATA/voxel_grid/train/gt
     event_root: /data1/YW/DVS_DATA/voxel_grid/train/event_0.1_0.1
     event_ext: .npy
     event_bins: 6
@@ -32,8 +32,8 @@ datasets:
     norm_event: true
   val:
     dataset_type: server_voxel
-    blur_root: /data1/YW/DVS_DATA/npz/test/blur
-    gt_root: /data1/YW/DVS_DATA/npz/test/gt
+    blur_root: /data1/YW/DVS_DATA/voxel_grid/test/blur
+    gt_root: /data1/YW/DVS_DATA/voxel_grid/test/gt
     event_root: /data1/YW/DVS_DATA/voxel_grid/test/event_0.1_0.1
     event_ext: .npy
     event_bins: 6
