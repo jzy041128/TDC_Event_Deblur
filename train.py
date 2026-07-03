@@ -143,6 +143,8 @@ def main():
     base_dim = model_cfg.get('base_dim', 32)
     fusion_type = model_cfg.get('fusion_type', 'hybrid')
     qkv_mode = model_cfg.get('qkv_mode', 'rgb_qk_event_v')
+    stage_fusion_mode = model_cfg.get('stage_fusion_mode', qkv_mode)
+    stage_fusion_dim = str(model_cfg.get('stage_fusion_dim', '3d'))
     late_fusion_mode = model_cfg.get('late_fusion_mode', 'kv_2d_k_tdc_v')
     window_size = model_cfg.get('window_size', 8)
     num_heads = model_cfg.get('num_heads', 4)
@@ -150,11 +152,21 @@ def main():
     event_encoder_type = model_cfg.get('event_encoder_type', '2d')
     attention_dim = model_cfg.get('attention_dim', '2d')
     temporal_window = model_cfg.get('temporal_window', 2)
+    gated_3devent_base = model_cfg.get('gated_3devent_base', 'tdc')
+    gated_3devent_gate = model_cfg.get('gated_3devent_gate', 'cbam3d')
+    gated_3devent_delta = model_cfg.get('gated_3devent_delta', 'dual_conv_residual')
+    gamma_init = model_cfg.get('gamma_init', 0.0)
+    event_inject_gamma_init = model_cfg.get('event_inject_gamma_init', 1.0)
+    use_rgb_self_attn_h4 = model_cfg.get('use_rgb_self_attn_all_scales', model_cfg.get('use_rgb_self_attn_h4', True))
+    use_event2d_self_attn_h4 = model_cfg.get('use_event2d_self_attn_all_scales', model_cfg.get('use_event2d_self_attn_h4', True))
+    use_event3d_self_attn_h4 = model_cfg.get('use_event3d_self_attn_all_scales', model_cfg.get('use_event3d_self_attn_h4', True))
     model = build_deblur_model(
         model_type=model_type,
         base_dim=base_dim,
         fusion_type=fusion_type,
         qkv_mode=qkv_mode,
+        stage_fusion_mode=stage_fusion_mode,
+        stage_fusion_dim=stage_fusion_dim,
         late_fusion_mode=late_fusion_mode,
         window_size=window_size,
         num_heads=num_heads,
@@ -162,14 +174,28 @@ def main():
         event_encoder_type=event_encoder_type,
         attention_dim=attention_dim,
         temporal_window=temporal_window,
+        gated_3devent_base=gated_3devent_base,
+        gated_3devent_gate=gated_3devent_gate,
+        gated_3devent_delta=gated_3devent_delta,
+        gamma_init=gamma_init,
+        event_inject_gamma_init=event_inject_gamma_init,
+        use_rgb_self_attn_h4=use_rgb_self_attn_h4,
+        use_event2d_self_attn_h4=use_event2d_self_attn_h4,
+        use_event3d_self_attn_h4=use_event3d_self_attn_h4,
     ).to(device)
     print(
         f"Model type: {model_type} | base_dim: {base_dim} | "
         f"fusion_type: {fusion_type} | qkv_mode: {qkv_mode} | "
+        f"stage_fusion_mode: {stage_fusion_mode} | stage_fusion_dim: {stage_fusion_dim} | "
         f"late_fusion_mode: {late_fusion_mode} | "
         f"window_size: {window_size} | num_heads: {num_heads} | qk_norm: {qk_norm} | "
         f"event_encoder_type: {event_encoder_type} | attention_dim: {attention_dim} | "
-        f"temporal_window: {temporal_window}"
+        f"temporal_window: {temporal_window} | "
+        f"gated_3devent_base: {gated_3devent_base} | "
+        f"gated_3devent_gate: {gated_3devent_gate} | "
+        f"gated_3devent_delta: {gated_3devent_delta} | gamma_init: {gamma_init} | "
+        f"event_inject_gamma_init: {event_inject_gamma_init} | "
+        f"self_attn_all_scales: {use_rgb_self_attn_h4}/{use_event2d_self_attn_h4}/{use_event3d_self_attn_h4}"
     )
     loss_cfg = config.get('loss', {})
     criterion = build_loss(
