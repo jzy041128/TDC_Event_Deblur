@@ -1096,13 +1096,6 @@ class StagedTriBranchDeblurNet(nn.Module):
         return img_feat, event2d_feat, event3d_feat, tdc3d_feat
 
     def fuse_stage(self, scale_idx, img_feat, event2d_feat, event3d_feat, tdc3d_feat):
-        img_feat, event2d_feat, event3d_feat, tdc3d_feat = self.apply_stage_attention(
-            scale_idx,
-            img_feat,
-            event2d_feat,
-            event3d_feat,
-            tdc3d_feat,
-        )
         fused3d = self.gated_3devent_fusions[scale_idx](event3d_feat, tdc3d_feat)
         return self.stage_fusions[scale_idx](img_feat, event2d_feat, fused3d)
 
@@ -1113,18 +1106,39 @@ class StagedTriBranchDeblurNet(nn.Module):
         event2d0 = self.event2d_encoder.enc0(event)
         event3d0 = self.event3d_encoder.stem(event_3d_input)
         tdc3d0 = self.tdc3d_encoder.stem(event_3d_input)
+        img0, event2d0, event3d0, tdc3d0 = self.apply_stage_attention(
+            0,
+            img0,
+            event2d0,
+            event3d0,
+            tdc3d0,
+        )
         fused0 = self.fuse_stage(0, img0, event2d0, event3d0, tdc3d0)
 
         img1 = self.image_encoder.enc1(fused0)
         event2d1 = self.event2d_encoder.enc1(event2d0)
         event3d1 = self.event3d_encoder.down1(event3d0)
         tdc3d1 = self.tdc3d_encoder.down1(tdc3d0)
+        img1, event2d1, event3d1, tdc3d1 = self.apply_stage_attention(
+            1,
+            img1,
+            event2d1,
+            event3d1,
+            tdc3d1,
+        )
         fused1 = self.fuse_stage(1, img1, event2d1, event3d1, tdc3d1)
 
         img2 = self.image_encoder.enc2(fused1)
         event2d2 = self.event2d_encoder.enc2(event2d1)
         event3d2 = self.event3d_encoder.down2(event3d1)
         tdc3d2 = self.tdc3d_encoder.down2(tdc3d1)
+        img2, event2d2, event3d2, tdc3d2 = self.apply_stage_attention(
+            2,
+            img2,
+            event2d2,
+            event3d2,
+            tdc3d2,
+        )
         fused2 = self.fuse_stage(2, img2, event2d2, event3d2, tdc3d2)
 
         x = self.up1(fused2, fused1)
