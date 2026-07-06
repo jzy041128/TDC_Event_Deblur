@@ -159,9 +159,13 @@ def build_model(config, device):
         model_type=model_cfg.get("type", "attention"),
         base_dim=model_cfg.get("base_dim", 32),
         fusion_type=model_cfg.get("fusion_type", "hybrid"),
+        fusion_family=model_cfg.get("fusion_family", "gated"),
         qkv_mode=model_cfg.get("qkv_mode", "rgb_qk_event_v"),
         stage_fusion_mode=model_cfg.get("stage_fusion_mode", model_cfg.get("qkv_mode", "rgb_qk_event_v")),
         stage_fusion_dim=str(model_cfg.get("stage_fusion_dim", "3d")),
+        internal_3d_ca_mode=model_cfg.get("internal_3d_ca_mode", "tdc_query"),
+        cascaded_ca_order=model_cfg.get("cascaded_ca_order", "motion_then_struct"),
+        event_fusion_dim=str(model_cfg.get("event_fusion_dim", "3d")),
         late_fusion_mode=model_cfg.get("late_fusion_mode", "kv_2d_k_tdc_v"),
         window_size=model_cfg.get("window_size", 8),
         num_heads=model_cfg.get("num_heads", 4),
@@ -235,9 +239,13 @@ def main():
     model_cfg = config.get("model", {})
     print(
         f"Model type: {model_cfg.get('type')} | fusion_type: {model_cfg.get('fusion_type')} | "
+        f"fusion_family: {model_cfg.get('fusion_family', 'gated')} | "
         f"qkv_mode: {model_cfg.get('qkv_mode')} | base_dim: {model_cfg.get('base_dim')} | "
         f"stage_fusion_mode: {model_cfg.get('stage_fusion_mode', model_cfg.get('qkv_mode'))} | "
         f"stage_fusion_dim: {model_cfg.get('stage_fusion_dim', '3d')} | "
+        f"internal_3d_ca_mode: {model_cfg.get('internal_3d_ca_mode', 'tdc_query')} | "
+        f"cascaded_ca_order: {model_cfg.get('cascaded_ca_order', 'motion_then_struct')} | "
+        f"event_fusion_dim: {model_cfg.get('event_fusion_dim', '3d')} | "
         f"window_size: {model_cfg.get('window_size')} | num_heads: {model_cfg.get('num_heads')} | "
         f"late_fusion_mode: {model_cfg.get('late_fusion_mode')} | "
         f"gated_3devent_base: {model_cfg.get('gated_3devent_base')} | "

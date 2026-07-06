@@ -142,9 +142,13 @@ def main():
     model_type = model_cfg.get('type', 'attention')
     base_dim = model_cfg.get('base_dim', 32)
     fusion_type = model_cfg.get('fusion_type', 'hybrid')
+    fusion_family = model_cfg.get('fusion_family', 'gated')
     qkv_mode = model_cfg.get('qkv_mode', 'rgb_qk_event_v')
     stage_fusion_mode = model_cfg.get('stage_fusion_mode', qkv_mode)
     stage_fusion_dim = str(model_cfg.get('stage_fusion_dim', '3d'))
+    internal_3d_ca_mode = model_cfg.get('internal_3d_ca_mode', 'tdc_query')
+    cascaded_ca_order = model_cfg.get('cascaded_ca_order', 'motion_then_struct')
+    event_fusion_dim = str(model_cfg.get('event_fusion_dim', '3d'))
     late_fusion_mode = model_cfg.get('late_fusion_mode', 'kv_2d_k_tdc_v')
     window_size = model_cfg.get('window_size', 8)
     num_heads = model_cfg.get('num_heads', 4)
@@ -164,9 +168,13 @@ def main():
         model_type=model_type,
         base_dim=base_dim,
         fusion_type=fusion_type,
+        fusion_family=fusion_family,
         qkv_mode=qkv_mode,
         stage_fusion_mode=stage_fusion_mode,
         stage_fusion_dim=stage_fusion_dim,
+        internal_3d_ca_mode=internal_3d_ca_mode,
+        cascaded_ca_order=cascaded_ca_order,
+        event_fusion_dim=event_fusion_dim,
         late_fusion_mode=late_fusion_mode,
         window_size=window_size,
         num_heads=num_heads,
@@ -185,8 +193,10 @@ def main():
     ).to(device)
     print(
         f"Model type: {model_type} | base_dim: {base_dim} | "
-        f"fusion_type: {fusion_type} | qkv_mode: {qkv_mode} | "
+        f"fusion_type: {fusion_type} | fusion_family: {fusion_family} | qkv_mode: {qkv_mode} | "
         f"stage_fusion_mode: {stage_fusion_mode} | stage_fusion_dim: {stage_fusion_dim} | "
+        f"internal_3d_ca_mode: {internal_3d_ca_mode} | cascaded_ca_order: {cascaded_ca_order} | "
+        f"event_fusion_dim: {event_fusion_dim} | "
         f"late_fusion_mode: {late_fusion_mode} | "
         f"window_size: {window_size} | num_heads: {num_heads} | qk_norm: {qk_norm} | "
         f"event_encoder_type: {event_encoder_type} | attention_dim: {attention_dim} | "
