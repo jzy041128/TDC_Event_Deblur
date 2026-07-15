@@ -1,68 +1,33 @@
-name: CascadedCA_TDCQuery_MotionThenStruct_Server_30ep
+name: ThreeBranch_Cat_2D_Server_60ep
 
 model:
-  # 1) structure type:
-  # progressive_fusion = current-scale fused RGB is downsampled into the next RGB stage.
-  # parallel_fusion    = each scale is encoded first, then fused independently.
   type: progressive_fusion
   base_dim: 32
 
-  # 2) fusion family:
-  # gated      = E/T first use SE/Spatial/CBAM gate, then RGB/Event2D/Gated3D fuse.
-  # cascaded_ca = no gate; E/T, RGB/F3D, RGB/Event2D use cascaded CrossAttention.
-  fusion_family: cascaded_ca
+  # cat / single_ca / cascaded_ca
+  fusion_mode: cat
+  # 2d: mean Event3D before fusion; 3d: preserve time until fusion finishes.
+  fusion_dim: 2d
 
-  # Gated options, used only when fusion_family: gated.
-  # gate base: tdc / e3d
-  gated_3devent_base: tdc
-  # gate type:
-  # se3d     = channel-only 3D gate
-  # spatial3d = spatial-temporal-only 3D gate
-  # cbam3d   = se3d + spatial3d
-  gated_3devent_gate: se3d
+  # Used by single_ca:
+  # event2d_k_event3d_v = Q:RGB, K:Event2D, V:Event3D
+  # event3d_k_event2d_v = Q:RGB, K:Event3D, V:Event2D
+  single_ca_order: event2d_k_event3d_v
 
-  # gated fusion dimension: 3d / 2d
-  stage_fusion_dim: 3d
-  # gated fusion mode: cat / qkv_2d_k_3d_v / qkv_3d_k_2d_v / qkv_merged / qkv_3d_only / qkv_2d_only
-  stage_fusion_mode: qkv_2d_k_3d_v
-
-  # Cascaded CrossAttention options, used only when fusion_family: cascaded_ca.
-  # internal_3d_ca_mode:
-  # tdc_query = F3D = T + CA3D(Q=T,K=E,V=E), TDC leads.
-  # e3d_query = F3D = E + CA3D(Q=E,K=T,V=T), ordinary 3D leads.
-  # cat       = F3D = Conv3D(cat(E,T)), no internal E/T attention.
-  internal_3d_ca_mode: tdc_query
-  # cascaded_ca_order:
-  # motion_then_struct = RGB first attends F3D, then attends Event2D.
-  # struct_then_motion = RGB first attends Event2D, then attends F3D.
-  # event_then_rgb     = F3D first attends Event2D, then RGB attends the fused event.
+  # Used by cascaded_ca:
+  # motion_then_struct = RGB attends Event3D, then Event2D
+  # struct_then_motion = RGB attends Event2D, then Event3D
+  # event_then_rgb     = Event3D attends Event2D, then RGB attends fused event
   cascaded_ca_order: motion_then_struct
-  # event_fusion_dim:
-  # 3d = event_then_rgb keeps F3D temporal dimension when fusing Event2D.
-  # 2d = event_then_rgb mean-pools F3D to 2D before fusing Event2D.
-  event_fusion_dim: 3d
 
-  gamma_init: 0.0
-  event_inject_gamma_init: 0.1
-  window_size: 8
-  temporal_window: 2
+  # Separate spatial windows for branch self-attention and feature fusion.
+  self_attn_window_size: 8
+  cross_attn_window_size: 8
+  # Used by Event3D self-attention and all 3D fusion modes.
+  temporal_window_size: 2
   num_heads: 4
   qk_norm: false
-  use_rgb_self_attn_all_scales: true
-  use_event2d_self_attn_all_scales: true
-  use_event3d_self_attn_all_scales: true
-
-  # Used only by the older late_fusion entry:
-  # late_fusion_mode: gated_3devent
-  # event_encoder_type: 2d
-  # attention_dim: 2d
-
-  # Legacy options for older non-gated baselines:
-  # fusion_type: hybrid
-  # qkv_mode: rgb_qk_event_v
-  # late_fusion_mode: kv_2d_k_tdc_v_plus
-  # event_encoder_type: 2d
-  # attention_dim: 2d
+  gamma_init: 0.1
 
 loss:
   type: l1
@@ -72,7 +37,7 @@ datasets:
   train:
     # 2060 profile:
     # dataset_type: h5
-    # dataroot: E:/GOPRO/GOPRO/train
+    # dataroot: F:/datasets/GOPRO/train
     # batch_size: 1
     # num_workers: 2
     # prefetch_factor: 2
@@ -93,7 +58,7 @@ datasets:
   val:
     # 2060 profile:
     # dataset_type: h5
-    # dataroot: E:/GOPRO/GOPRO/test
+    # dataroot: F:/datasets/GOPRO/test
     # max_open_h5: 2
 
     # Server profile:
@@ -105,12 +70,11 @@ datasets:
     event_bins: 6
     patch_size: 256
     norm_event: true
+    num_workers: 0
 
 train:
-  num_epochs: 30
+  num_epochs: 60
   learning_rate: 0.0002
-  # Server 7-GPU is selected by command, not YAML:
-  # torchrun --nproc_per_node=7 train_ddp.py --config configs/train_tdc_tribranch.yml
 
 path:
   # 2060: ./experiments

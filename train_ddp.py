@@ -13,7 +13,7 @@ import yaml
 from skimage.metrics import peak_signal_noise_ratio as calculate_psnr
 from skimage.metrics import structural_similarity as calculate_ssim
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
 from data.dataset import build_dataset
@@ -41,6 +41,22 @@ class NullWriter(object):
 
     def flush(self):
         pass
+
+
+class RankStrideSampler(Sampler):
+    """Exact distributed evaluation split without padding or duplicate samples."""
+
+    def __init__(self, dataset, rank, world_size):
+        self.dataset = dataset
+        self.rank = rank
+        self.world_size = world_size
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self):
+        remaining = len(self.dataset) - self.rank
+        return max(0, (remaining + self.world_size - 1) // self.world_size)
 
 
 def parse_args():
@@ -137,56 +153,27 @@ def build_loaders(config, rank, world_size):
         train_loader_kwargs["prefetch_factor"] = train_opt.get("prefetch_factor", 2)
     train_loader = DataLoader(train_dataset, **train_loader_kwargs)
 
-    val_loader = None
-    if rank0():
-        val_opt = dict(config["datasets"]["val"])
-        val_opt["split"] = "val"
-        val_opt["random_crop"] = False
-        val_dataset = build_dataset(val_opt)
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=True,
-        )
+    val_opt = dict(config["datasets"]["val"])
+    val_opt["split"] = "val"
+    val_opt["random_crop"] = False
+    val_dataset = build_dataset(val_opt)
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=1,
+        sampler=RankStrideSampler(val_dataset, rank, world_size),
+        num_workers=val_opt.get("num_workers", 0),
+        pin_memory=True,
+    )
     return train_loader, train_sampler, val_loader
 
 
 def build_model(config, device):
-    model_cfg = config.get("model", {})
-    model = build_deblur_model(
-        model_type=model_cfg.get("type", "attention"),
-        base_dim=model_cfg.get("base_dim", 32),
-        fusion_type=model_cfg.get("fusion_type", "hybrid"),
-        fusion_family=model_cfg.get("fusion_family", "gated"),
-        qkv_mode=model_cfg.get("qkv_mode", "rgb_qk_event_v"),
-        stage_fusion_mode=model_cfg.get("stage_fusion_mode", model_cfg.get("qkv_mode", "rgb_qk_event_v")),
-        stage_fusion_dim=str(model_cfg.get("stage_fusion_dim", "3d")),
-        internal_3d_ca_mode=model_cfg.get("internal_3d_ca_mode", "tdc_query"),
-        cascaded_ca_order=model_cfg.get("cascaded_ca_order", "motion_then_struct"),
-        event_fusion_dim=str(model_cfg.get("event_fusion_dim", "3d")),
-        late_fusion_mode=model_cfg.get("late_fusion_mode", "kv_2d_k_tdc_v"),
-        window_size=model_cfg.get("window_size", 8),
-        num_heads=model_cfg.get("num_heads", 4),
-        qk_norm=model_cfg.get("qk_norm", False),
-        event_encoder_type=model_cfg.get("event_encoder_type", "2d"),
-        attention_dim=model_cfg.get("attention_dim", "2d"),
-        temporal_window=model_cfg.get("temporal_window", 2),
-        gated_3devent_base=model_cfg.get("gated_3devent_base", "tdc"),
-        gated_3devent_gate=model_cfg.get("gated_3devent_gate", "cbam3d"),
-        gated_3devent_delta=model_cfg.get("gated_3devent_delta", "dual_conv_residual"),
-        gamma_init=model_cfg.get("gamma_init", 0.0),
-        event_inject_gamma_init=model_cfg.get("event_inject_gamma_init", 1.0),
-        use_rgb_self_attn_h4=model_cfg.get("use_rgb_self_attn_all_scales", model_cfg.get("use_rgb_self_attn_h4", True)),
-        use_event2d_self_attn_h4=model_cfg.get("use_event2d_self_attn_all_scales", model_cfg.get("use_event2d_self_attn_h4", True)),
-        use_event3d_self_attn_h4=model_cfg.get("use_event3d_self_attn_all_scales", model_cfg.get("use_event3d_self_attn_h4", True)),
-    ).to(device)
+    model = build_deblur_model(**dict(config.get("model", {}))).to(device)
     return DDP(
         model,
         device_ids=[device.index],
         output_device=device.index,
-        find_unused_parameters=True,
+        find_unused_parameters=False,
     )
 
 
@@ -209,9 +196,16 @@ def validate(model, val_loader, device):
             total_pred_psnr += calculate_psnr(gt_np, pred_np, data_range=1.0)
             total_ssim += calculate_ssim(gt_np, pred_np, channel_axis=2, data_range=1.0)
 
-    avg_blur_psnr = total_blur_psnr / len(val_loader)
-    avg_psnr = total_pred_psnr / len(val_loader)
-    avg_ssim = total_ssim / len(val_loader)
+    totals = torch.tensor(
+        [total_blur_psnr, total_pred_psnr, total_ssim, len(val_loader)],
+        dtype=torch.float64,
+        device=device,
+    )
+    dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    count = max(totals[3].item(), 1.0)
+    avg_blur_psnr = totals[0].item() / count
+    avg_psnr = totals[1].item() / count
+    avg_ssim = totals[2].item() / count
     return avg_blur_psnr, avg_psnr, avg_ssim
 
 
@@ -238,25 +232,14 @@ def main():
     model = build_model(config, device)
     model_cfg = config.get("model", {})
     print(
-        f"Model type: {model_cfg.get('type')} | fusion_type: {model_cfg.get('fusion_type')} | "
-        f"fusion_family: {model_cfg.get('fusion_family', 'gated')} | "
-        f"qkv_mode: {model_cfg.get('qkv_mode')} | base_dim: {model_cfg.get('base_dim')} | "
-        f"stage_fusion_mode: {model_cfg.get('stage_fusion_mode', model_cfg.get('qkv_mode'))} | "
-        f"stage_fusion_dim: {model_cfg.get('stage_fusion_dim', '3d')} | "
-        f"internal_3d_ca_mode: {model_cfg.get('internal_3d_ca_mode', 'tdc_query')} | "
+        f"Model: three_branch_progressive | base_dim: {model_cfg.get('base_dim', 32)} | "
+        f"fusion_mode: {model_cfg.get('fusion_mode', 'single_ca')} | "
+        f"fusion_dim: {model_cfg.get('fusion_dim', '2d')} | "
+        f"single_ca_order: {model_cfg.get('single_ca_order', 'event2d_k_event3d_v')} | "
         f"cascaded_ca_order: {model_cfg.get('cascaded_ca_order', 'motion_then_struct')} | "
-        f"event_fusion_dim: {model_cfg.get('event_fusion_dim', '3d')} | "
-        f"window_size: {model_cfg.get('window_size')} | num_heads: {model_cfg.get('num_heads')} | "
-        f"late_fusion_mode: {model_cfg.get('late_fusion_mode')} | "
-        f"gated_3devent_base: {model_cfg.get('gated_3devent_base')} | "
-        f"gated_3devent_gate: {model_cfg.get('gated_3devent_gate')} | "
-        f"gated_3devent_delta: {model_cfg.get('gated_3devent_delta')} | "
-        f"gamma_init: {model_cfg.get('gamma_init')} | "
-        f"event_inject_gamma_init: {model_cfg.get('event_inject_gamma_init')} | "
-        f"self_attn_all_scales: "
-        f"{model_cfg.get('use_rgb_self_attn_all_scales', model_cfg.get('use_rgb_self_attn_h4', True))}/"
-        f"{model_cfg.get('use_event2d_self_attn_all_scales', model_cfg.get('use_event2d_self_attn_h4', True))}/"
-        f"{model_cfg.get('use_event3d_self_attn_all_scales', model_cfg.get('use_event3d_self_attn_h4', True))}"
+        f"windows(self/cross/time): {model_cfg.get('self_attn_window_size', 8)}/"
+        f"{model_cfg.get('cross_attn_window_size', 8)}/{model_cfg.get('temporal_window_size', 2)} | "
+        f"num_heads: {model_cfg.get('num_heads', 4)}"
     )
 
     loss_cfg = config.get("loss", {})
@@ -271,7 +254,7 @@ def main():
     if resume_path and resume_path != "~":
         if os.path.exists(resume_path):
             checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
-            unwrap_model(model).load_state_dict(checkpoint["model_state_dict"], strict=False)
+            unwrap_model(model).load_state_dict(checkpoint["model_state_dict"], strict=True)
             try:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             except ValueError:
@@ -313,16 +296,19 @@ def main():
         dist.all_reduce(epoch_loss, op=dist.ReduceOp.SUM)
         avg_train_loss = (epoch_loss / (max(steps_this_epoch, 1) * world_size)).item()
         avg_psnr = 0.0
-        if rank0():
-            skip_validation = config["train"].get("skip_validation", False)
-            if skip_validation:
+        skip_validation = config["train"].get("skip_validation", False)
+        if skip_validation:
+            if rank0():
                 print(f"\nEpoch {epoch+1} train done, avg loss: {avg_train_loss:.4f}. Validation skipped.")
-            else:
+        else:
+            if rank0():
                 print(f"\nEpoch {epoch+1} train done, avg loss: {avg_train_loss:.4f}. Validating...")
-                avg_blur_psnr, avg_psnr, avg_ssim = validate(model, val_loader, device)
+            avg_blur_psnr, avg_psnr, avg_ssim = validate(model, val_loader, device)
+            if rank0():
                 psnr_gain = avg_psnr - avg_blur_psnr
                 print(f"Val -> Blur PSNR: {avg_blur_psnr:.2f} dB | Pred PSNR: {avg_psnr:.2f} dB | Gain: {psnr_gain:+.2f} dB | SSIM: {avg_ssim:.4f}\n")
 
+        if rank0():
             elapsed_total = time.time() - train_start_time
             elapsed_epoch = time.time() - epoch_start_time
             remaining_epochs = num_epochs - epoch - 1

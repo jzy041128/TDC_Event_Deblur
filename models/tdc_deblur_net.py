@@ -1,23 +1,24 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.sta_module import CrossModalSTA
-from models.tdc_module import TDCBlock3D
+from models.tdc_module import ShortTermTDCBlock3D
 
 
 def conv3x3(in_channels, out_channels, stride=1):
-    return nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1)
+    return nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1)
 
 
 class ConvBlock2D(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
         self.block = nn.Sequential(
-            conv3x3(in_channels, out_channels, stride=stride),
-            nn.LeakyReLU(0.2, True),
+            conv3x3(in_channels, out_channels, stride),
+            nn.LeakyReLU(0.2, inplace=True),
             conv3x3(out_channels, out_channels),
-            nn.LeakyReLU(0.2, True),
+            nn.LeakyReLU(0.2, inplace=True),
         )
 
     def forward(self, x):
@@ -27,1849 +28,440 @@ class ConvBlock2D(nn.Module):
 class UpBlock(nn.Module):
     def __init__(self, in_channels, skip_channels, out_channels):
         super().__init__()
-        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1)
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, 4, stride=2, padding=1)
         self.refine = ConvBlock2D(out_channels + skip_channels, out_channels)
 
     def forward(self, x, skip):
         x = self.up(x)
         if x.shape[-2:] != skip.shape[-2:]:
-            x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
+            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
         return self.refine(torch.cat([x, skip], dim=1))
 
 
-class ThreeScaleImageEncoder(nn.Module):
-    def __init__(self, rgb_in=3, base_dim=32):
-        super().__init__()
-        self.enc0 = ConvBlock2D(rgb_in, base_dim)
-        self.enc1 = ConvBlock2D(base_dim, base_dim * 2, stride=2)
-        self.enc2 = ConvBlock2D(base_dim * 2, base_dim * 4, stride=2)
-
-    def forward(self, x):
-        feat0 = self.enc0(x)
-        feat1 = self.enc1(feat0)
-        feat2 = self.enc2(feat1)
-        return [feat0, feat1, feat2]
-
-
-class EventVoxel2DEncoder(nn.Module):
-    def __init__(self, event_in=6, base_dim=32):
-        super().__init__()
-        self.enc0 = ConvBlock2D(event_in, base_dim)
-        self.enc1 = ConvBlock2D(base_dim, base_dim * 2, stride=2)
-        self.enc2 = ConvBlock2D(base_dim * 2, base_dim * 4, stride=2)
-
-    def forward(self, event):
-        feat0 = self.enc0(event)
-        feat1 = self.enc1(feat0)
-        feat2 = self.enc2(feat1)
-        return [feat0, feat1, feat2]
-
-
-class EventVoxel3DEncoder(nn.Module):
-    def __init__(self, base_dim=32):
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv3d(1, base_dim, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
-            nn.BatchNorm3d(base_dim),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv3d(base_dim, base_dim, kernel_size=(1, 3, 3), padding=(0, 1, 1)),
-            nn.BatchNorm3d(base_dim),
-            nn.LeakyReLU(0.2, True),
-        )
-        self.down1 = nn.Sequential(
-            nn.Conv3d(base_dim, base_dim * 2, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
-            nn.BatchNorm3d(base_dim * 2),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv3d(base_dim * 2, base_dim * 2, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)),
-            nn.BatchNorm3d(base_dim * 2),
-            nn.LeakyReLU(0.2, True),
-        )
-        self.down2 = nn.Sequential(
-            nn.Conv3d(base_dim * 2, base_dim * 4, kernel_size=(3, 3, 3), padding=(1, 1, 1)),
-            nn.BatchNorm3d(base_dim * 4),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv3d(base_dim * 4, base_dim * 4, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)),
-            nn.BatchNorm3d(base_dim * 4),
-            nn.LeakyReLU(0.2, True),
-        )
-
-    @staticmethod
-    def pool_time(x):
-        return x.mean(dim=2)
-
-    def forward(self, event, return_3d=False):
-        x = event.unsqueeze(1)
-        feat0_3d = self.stem(x)
-        feat1_3d = self.down1(feat0_3d)
-        feat2_3d = self.down2(feat1_3d)
-        feats_3d = [feat0_3d, feat1_3d, feat2_3d]
-        feats_2d = [self.pool_time(feat) for feat in feats_3d]
-        if return_3d:
-            return feats_2d, feats_3d
-        return feats_2d, None
-
-
-class EventTDC3DEncoder(nn.Module):
-    def __init__(self, base_dim=32):
-        super().__init__()
-        self.stem = nn.Sequential(
-            TDCBlock3D(1, base_dim),
-            nn.Conv3d(base_dim, base_dim, kernel_size=1),
-            nn.LeakyReLU(0.2, True),
-        )
-        self.down1 = nn.Sequential(
-            TDCBlock3D(base_dim, base_dim * 2),
-            nn.Conv3d(base_dim * 2, base_dim * 2, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)),
-            nn.LeakyReLU(0.2, True),
-        )
-        self.down2 = nn.Sequential(
-            TDCBlock3D(base_dim * 2, base_dim * 4),
-            nn.Conv3d(base_dim * 4, base_dim * 4, kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)),
-            nn.LeakyReLU(0.2, True),
-        )
-
-    @staticmethod
-    def pool_time(x):
-        return x.mean(dim=2)
-
-    def forward(self, event, return_3d=False):
-        x = event.unsqueeze(1)
-        feat0_3d = self.stem(x)
-        feat1_3d = self.down1(feat0_3d)
-        feat2_3d = self.down2(feat1_3d)
-        feats_3d = [feat0_3d, feat1_3d, feat2_3d]
-        feats_2d = [self.pool_time(feat) for feat in feats_3d]
-        if return_3d:
-            return feats_2d, feats_3d
-        return feats_2d, None
-
-
-class EventEncoderWith3DOption(nn.Module):
-    def __init__(self, event_in=6, base_dim=32, encoder_type='2d'):
-        super().__init__()
-        self.encoder_type = encoder_type.lower()
-        if self.encoder_type == '2d':
-            self.encoder = EventVoxel2DEncoder(event_in=event_in, base_dim=base_dim)
-        elif self.encoder_type == '3d':
-            self.encoder = EventVoxel3DEncoder(base_dim=base_dim)
-        else:
-            raise ValueError(f'Unknown event_encoder_type: {encoder_type}')
-
-    def forward(self, event, return_3d=False):
-        if self.encoder_type == '3d':
-            return self.encoder(event, return_3d=return_3d)
-        feats_2d = self.encoder(event)
-        if return_3d:
-            return feats_2d, None
-        return feats_2d, None
-
-
-class DualEventEncoder(nn.Module):
-    def __init__(self, event_in=6, base_dim=32):
-        super().__init__()
-        dims = [base_dim, base_dim * 2, base_dim * 4]
-        self.voxel_2d = EventVoxel2DEncoder(event_in=event_in, base_dim=base_dim)
-        self.tdc_3d = EventTDC3DEncoder(base_dim=base_dim)
-        self.merge = nn.ModuleList([
-            ConvBlock2D(dim * 2, dim) for dim in dims
-        ])
-
-    def forward(self, event):
-        voxel_feats = self.voxel_2d(event)
-        temporal_feats, _ = self.tdc_3d(event)
-        return [
-            merge(torch.cat([voxel, temporal], dim=1))
-            for merge, voxel, temporal in zip(self.merge, voxel_feats, temporal_feats)
-        ]
-
-
-class EventGate(nn.Module):
+class ChannelLayerNorm2D(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        self.gate = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=1),
-            nn.Sigmoid(),
-        )
+        self.norm = nn.LayerNorm(channels)
 
-    def forward(self, event_feat):
-        return self.gate(event_feat)
+    def forward(self, x):
+        return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
+
+
+class ChannelLayerNorm3D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels)
+
+    def forward(self, x):
+        return self.norm(x.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3).contiguous()
+
+
+def partition_2d(x, window_size):
+    b, c, h, w = x.shape
+    hp = math.ceil(h / window_size) * window_size
+    wp = math.ceil(w / window_size) * window_size
+    x = F.pad(x, (0, wp - w, 0, hp - h))
+    x = x.view(b, c, hp // window_size, window_size, wp // window_size, window_size)
+    x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
+    return x.view(-1, window_size * window_size, c), (b, h, w, hp, wp)
+
+
+def reverse_2d(windows, shape, window_size):
+    b, h, w, hp, wp = shape
+    c = windows.shape[-1]
+    x = windows.view(b, hp // window_size, wp // window_size, window_size, window_size, c)
+    x = x.permute(0, 5, 1, 3, 2, 4).contiguous().view(b, c, hp, wp)
+    return x[:, :, :h, :w]
+
+
+def partition_3d(x, temporal_window, spatial_window):
+    b, c, t, h, w = x.shape
+    tp = math.ceil(t / temporal_window) * temporal_window
+    hp = math.ceil(h / spatial_window) * spatial_window
+    wp = math.ceil(w / spatial_window) * spatial_window
+    x = F.pad(x, (0, wp - w, 0, hp - h, 0, tp - t))
+    x = x.view(
+        b,
+        c,
+        tp // temporal_window,
+        temporal_window,
+        hp // spatial_window,
+        spatial_window,
+        wp // spatial_window,
+        spatial_window,
+    )
+    x = x.permute(0, 2, 4, 6, 3, 5, 7, 1).contiguous()
+    tokens = temporal_window * spatial_window * spatial_window
+    return x.view(-1, tokens, c), (b, t, h, w, tp, hp, wp)
+
+
+def reverse_3d(windows, shape, temporal_window, spatial_window):
+    b, t, h, w, tp, hp, wp = shape
+    c = windows.shape[-1]
+    x = windows.view(
+        b,
+        tp // temporal_window,
+        hp // spatial_window,
+        wp // spatial_window,
+        temporal_window,
+        spatial_window,
+        spatial_window,
+        c,
+    )
+    x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous().view(b, c, tp, hp, wp)
+    return x[:, :, :t, :h, :w]
+
+
+def attention(q, k, v, num_heads, qk_norm=False):
+    batch_windows, tokens, channels = q.shape
+    head_dim = channels // num_heads
+    q = q.view(batch_windows, tokens, num_heads, head_dim).transpose(1, 2)
+    k = k.view(batch_windows, tokens, num_heads, head_dim).transpose(1, 2)
+    v = v.view(batch_windows, tokens, num_heads, head_dim).transpose(1, 2)
+    if qk_norm:
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        scale = 1.0
+    else:
+        scale = head_dim ** -0.5
+    weights = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) * scale, dim=-1)
+    out = torch.matmul(weights, v).transpose(1, 2).contiguous()
+    return out.view(batch_windows, tokens, channels)
+
+
+class WindowSelfAttention2D(nn.Module):
+    def __init__(self, channels, window_size, num_heads, qk_norm=False):
+        super().__init__()
+        if channels % num_heads:
+            raise ValueError("channels must be divisible by num_heads")
+        self.window_size = window_size
+        self.num_heads = num_heads
+        self.qk_norm = qk_norm
+        self.norm = ChannelLayerNorm2D(channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
+        self.proj = nn.Conv2d(channels, channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        residual = x
+        q, k, v = self.qkv(self.norm(x)).chunk(3, dim=1)
+        q, shape = partition_2d(q, self.window_size)
+        k, _ = partition_2d(k, self.window_size)
+        v, _ = partition_2d(v, self.window_size)
+        out = attention(q, k, v, self.num_heads, self.qk_norm)
+        out = reverse_2d(out, shape, self.window_size)
+        return residual + self.gamma * self.proj(out)
+
+
+class WindowSelfAttention3D(nn.Module):
+    def __init__(self, channels, spatial_window, temporal_window, num_heads, qk_norm=False):
+        super().__init__()
+        if channels % num_heads:
+            raise ValueError("channels must be divisible by num_heads")
+        self.spatial_window = spatial_window
+        self.temporal_window = temporal_window
+        self.num_heads = num_heads
+        self.qk_norm = qk_norm
+        self.norm = ChannelLayerNorm3D(channels)
+        self.qkv = nn.Conv3d(channels, channels * 3, 1, bias=False)
+        self.proj = nn.Conv3d(channels, channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        residual = x
+        q, k, v = self.qkv(self.norm(x)).chunk(3, dim=1)
+        q, shape = partition_3d(q, self.temporal_window, self.spatial_window)
+        k, _ = partition_3d(k, self.temporal_window, self.spatial_window)
+        v, _ = partition_3d(v, self.temporal_window, self.spatial_window)
+        out = attention(q, k, v, self.num_heads, self.qk_norm)
+        out = reverse_3d(out, shape, self.temporal_window, self.spatial_window)
+        return residual + self.gamma * self.proj(out)
+
+
+class WindowCrossAttention2D(nn.Module):
+    def __init__(self, channels, window_size, num_heads, qk_norm=False):
+        super().__init__()
+        self.window_size = window_size
+        self.num_heads = num_heads
+        self.qk_norm = qk_norm
+        self.norm_q = ChannelLayerNorm2D(channels)
+        self.norm_k = ChannelLayerNorm2D(channels)
+        self.norm_v = ChannelLayerNorm2D(channels)
+        self.q = nn.Conv2d(channels, channels, 1, bias=False)
+        self.k = nn.Conv2d(channels, channels, 1, bias=False)
+        self.v = nn.Conv2d(channels, channels, 1, bias=False)
+        self.proj = nn.Conv2d(channels, channels, 1)
+
+    def forward(self, query, key, value):
+        q, shape = partition_2d(self.q(self.norm_q(query)), self.window_size)
+        k, _ = partition_2d(self.k(self.norm_k(key)), self.window_size)
+        v, _ = partition_2d(self.v(self.norm_v(value)), self.window_size)
+        out = attention(q, k, v, self.num_heads, self.qk_norm)
+        return self.proj(reverse_2d(out, shape, self.window_size))
+
+
+class WindowCrossAttention3D(nn.Module):
+    def __init__(self, channels, spatial_window, temporal_window, num_heads, qk_norm=False):
+        super().__init__()
+        self.spatial_window = spatial_window
+        self.temporal_window = temporal_window
+        self.num_heads = num_heads
+        self.qk_norm = qk_norm
+        self.norm_q = ChannelLayerNorm3D(channels)
+        self.norm_k = ChannelLayerNorm3D(channels)
+        self.norm_v = ChannelLayerNorm3D(channels)
+        self.q = nn.Conv3d(channels, channels, 1, bias=False)
+        self.k = nn.Conv3d(channels, channels, 1, bias=False)
+        self.v = nn.Conv3d(channels, channels, 1, bias=False)
+        self.proj = nn.Conv3d(channels, channels, 1)
+
+    def forward(self, query, key, value):
+        q, shape = partition_3d(self.q(self.norm_q(query)), self.temporal_window, self.spatial_window)
+        k, _ = partition_3d(self.k(self.norm_k(key)), self.temporal_window, self.spatial_window)
+        v, _ = partition_3d(self.v(self.norm_v(value)), self.temporal_window, self.spatial_window)
+        out = attention(q, k, v, self.num_heads, self.qk_norm)
+        out = reverse_3d(out, shape, self.temporal_window, self.spatial_window)
+        return self.proj(out)
 
 
 class ConvFFN2D(nn.Module):
-    def __init__(self, channels, expansion=2):
+    def __init__(self, channels):
         super().__init__()
-        hidden_channels = channels * expansion
         self.net = nn.Sequential(
-            nn.Conv2d(channels, hidden_channels, kernel_size=1),
+            nn.Conv2d(channels, channels * 2, 1),
             nn.GELU(),
-            nn.Conv2d(
-                hidden_channels,
-                hidden_channels,
-                kernel_size=3,
-                padding=1,
-                groups=hidden_channels,
-            ),
+            nn.Conv2d(channels * 2, channels * 2, 3, padding=1, groups=channels * 2),
             nn.GELU(),
-            nn.Conv2d(hidden_channels, channels, kernel_size=1),
+            nn.Conv2d(channels * 2, channels, 1),
         )
 
     def forward(self, x):
         return self.net(x)
 
 
-class ChannelSelfAttention2D(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.norm = nn.GroupNorm(1, channels)
-        self.q = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.k = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.v = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.gamma = nn.Parameter(torch.zeros(1))
+class ThreeBranchStageFusion(nn.Module):
+    SINGLE_ORDERS = {"event2d_k_event3d_v", "event3d_k_event2d_v"}
+    CASCADE_ORDERS = {"motion_then_struct", "struct_then_motion", "event_then_rgb"}
 
-    def forward(self, x):
-        residual = x
-        x = self.norm(x)
-        b, c, h, w = x.shape
-        q = self.q(x).view(b, c, -1)
-        k = self.k(x).view(b, c, -1)
-        v = self.v(x).view(b, c, -1)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v).view(b, c, h, w)
-        return residual + self.gamma * self.proj(out)
-
-
-class ChannelSelfAttention3D(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.norm = nn.GroupNorm(1, channels)
-        self.q = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.k = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.v = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.proj = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):
-        residual = x
-        x = self.norm(x)
-        b, c, t, h, w = x.shape
-        q = self.q(x).view(b, c, -1)
-        k = self.k(x).view(b, c, -1)
-        v = self.v(x).view(b, c, -1)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v).view(b, c, t, h, w)
-        return residual + self.gamma * self.proj(out)
-
-
-class WindowSelfAttention2D(nn.Module):
-    def __init__(self, channels, window_size=8, num_heads=4, qk_norm=False):
-        super().__init__()
-        if channels % num_heads != 0:
-            raise ValueError(f'channels ({channels}) must be divisible by num_heads ({num_heads})')
-        self.channels = channels
-        self.window_size = window_size
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qk_norm = qk_norm
-        self.norm = nn.GroupNorm(1, channels)
-        self.q = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.k = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.v = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def partition_windows(self, x):
-        b, c, h, w = x.shape
-        ws = self.window_size
-        pad_h = (ws - h % ws) % ws
-        pad_w = (ws - w % ws) % ws
-        x = F.pad(x, (0, pad_w, 0, pad_h))
-        hp, wp = x.shape[-2:]
-        x = x.view(b, c, hp // ws, ws, wp // ws, ws)
-        x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
-        return x.view(-1, ws * ws, c), (h, w, hp, wp)
-
-    def reverse_windows(self, x, shape_info, batch_size):
-        h, w, hp, wp = shape_info
-        ws = self.window_size
-        x = x.view(batch_size, hp // ws, wp // ws, ws, ws, self.channels)
-        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
-        x = x.view(batch_size, self.channels, hp, wp)
-        return x[:, :, :h, :w]
-
-    def forward(self, x):
-        residual = x
-        x = self.norm(x)
-        q = self.q(x)
-        k = self.k(x)
-        v = self.v(x)
-        b = q.shape[0]
-        q_windows, shape_info = self.partition_windows(q)
-        k_windows, _ = self.partition_windows(k)
-        v_windows, _ = self.partition_windows(v)
-
-        def split_heads(tensor):
-            tensor = tensor.view(tensor.shape[0], tensor.shape[1], self.num_heads, self.head_dim)
-            return tensor.permute(0, 2, 1, 3)
-
-        q_windows = split_heads(q_windows)
-        k_windows = split_heads(k_windows)
-        v_windows = split_heads(v_windows)
-        if self.qk_norm:
-            q_windows = F.normalize(q_windows, dim=-1)
-            k_windows = F.normalize(k_windows, dim=-1)
-        attn = torch.matmul(q_windows, k_windows.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v_windows)
-        out = out.permute(0, 2, 1, 3).contiguous().view(out.shape[0], -1, self.channels)
-        out = self.reverse_windows(out, shape_info, b)
-        return residual + self.gamma * self.proj(out)
-
-
-class WindowSelfAttention3D(nn.Module):
-    def __init__(self, channels, window_size=8, temporal_window=2, num_heads=4, qk_norm=False):
-        super().__init__()
-        if channels % num_heads != 0:
-            raise ValueError(f'channels ({channels}) must be divisible by num_heads ({num_heads})')
-        self.channels = channels
-        self.window_size = window_size
-        self.temporal_window = temporal_window
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qk_norm = qk_norm
-        self.norm = nn.GroupNorm(1, channels)
-        self.q = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.k = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.v = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.proj = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def partition_windows(self, x):
-        b, c, t, h, w = x.shape
-        wt = min(self.temporal_window, t)
-        ws = self.window_size
-        pad_t = (wt - t % wt) % wt
-        pad_h = (ws - h % ws) % ws
-        pad_w = (ws - w % ws) % ws
-        x = F.pad(x, (0, pad_w, 0, pad_h, 0, pad_t))
-        tp, hp, wp = x.shape[-3:]
-        x = x.view(b, c, tp // wt, wt, hp // ws, ws, wp // ws, ws)
-        x = x.permute(0, 2, 4, 6, 3, 5, 7, 1).contiguous()
-        return x.view(-1, wt * ws * ws, c), (t, h, w, tp, hp, wp, wt, ws)
-
-    def reverse_windows(self, x, shape_info, batch_size):
-        t, h, w, tp, hp, wp, wt, ws = shape_info
-        x = x.view(batch_size, tp // wt, hp // ws, wp // ws, wt, ws, ws, self.channels)
-        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
-        x = x.view(batch_size, self.channels, tp, hp, wp)
-        return x[:, :, :t, :h, :w]
-
-    def forward(self, x):
-        residual = x
-        x = self.norm(x)
-        q = self.q(x)
-        k = self.k(x)
-        v = self.v(x)
-        b = q.shape[0]
-        q_windows, shape_info = self.partition_windows(q)
-        k_windows, _ = self.partition_windows(k)
-        v_windows, _ = self.partition_windows(v)
-
-        def split_heads(tensor):
-            tensor = tensor.view(tensor.shape[0], tensor.shape[1], self.num_heads, self.head_dim)
-            return tensor.permute(0, 2, 1, 3)
-
-        q_windows = split_heads(q_windows)
-        k_windows = split_heads(k_windows)
-        v_windows = split_heads(v_windows)
-        if self.qk_norm:
-            q_windows = F.normalize(q_windows, dim=-1)
-            k_windows = F.normalize(k_windows, dim=-1)
-        attn = torch.matmul(q_windows, k_windows.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v_windows)
-        out = out.permute(0, 2, 1, 3).contiguous().view(out.shape[0], -1, self.channels)
-        out = self.reverse_windows(out, shape_info, b)
-        return residual + self.gamma * self.proj(out)
-
-
-class ConvResidual3D(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv3d(4 * channels, channels, kernel_size=1),
-            nn.GELU(),
-            nn.Conv3d(channels, channels, kernel_size=3, padding=1, groups=channels),
-            nn.GELU(),
-            nn.Conv3d(channels, channels, kernel_size=1),
-        )
-
-    def forward(self, relation):
-        return self.net(relation)
-
-
-class SE3DGate(nn.Module):
-    def __init__(self, channels, reduction=4):
-        super().__init__()
-        hidden = max(channels // reduction, 8)
-        self.net = nn.Sequential(
-            nn.AdaptiveAvgPool3d(1),
-            nn.Conv3d(4 * channels, hidden, kernel_size=1),
-            nn.GELU(),
-            nn.Conv3d(hidden, channels, kernel_size=1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, relation):
-        return self.net(relation)
-
-
-class Spatial3DGate(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv3d(4 * channels, channels, kernel_size=1),
-            nn.GELU(),
-            nn.Conv3d(channels, 1, kernel_size=3, padding=1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, relation):
-        return self.net(relation)
-
-
-class CBAM3DGate(nn.Module):
-    def __init__(self, channels, reduction=4):
-        super().__init__()
-        self.channel_gate = SE3DGate(channels, reduction=reduction)
-        self.spatial_gate = Spatial3DGate(channels)
-
-    def forward(self, relation):
-        return self.channel_gate(relation) * self.spatial_gate(relation)
-
-
-class Gated3DEventFusion(nn.Module):
-    def __init__(self, channels, base='tdc', gate='cbam3d', gamma_init=0.0):
-        super().__init__()
-        self.base = base.lower()
-        self.gate_type = gate.lower()
-        if self.base not in ('e3d', 'tdc'):
-            raise ValueError(f'Unknown gated_3devent_base: {base}')
-        self.delta = ConvResidual3D(channels)
-        if self.gate_type == 'se3d':
-            self.gate = SE3DGate(channels)
-        elif self.gate_type == 'cbam3d':
-            self.gate = CBAM3DGate(channels)
-        elif self.gate_type == 'spatial3d':
-            self.gate = Spatial3DGate(channels)
-        else:
-            raise ValueError(f'Unknown gated_3devent_gate: {gate}')
-        self.gamma = nn.Parameter(torch.ones(1) * gamma_init)
-
-    def forward(self, e3d, tdc3d):
-        if e3d.shape != tdc3d.shape:
-            raise ValueError(f'E/T 3D feature shape mismatch: {e3d.shape} vs {tdc3d.shape}')
-        relation = torch.cat([e3d, tdc3d, e3d - tdc3d, e3d * tdc3d], dim=1)
-        base_feat = e3d if self.base == 'e3d' else tdc3d
-        return base_feat + self.gamma * self.gate(relation) * self.delta(relation)
-
-
-class ChannelCrossAttention2D(nn.Module):
-    def __init__(self, channels, qkv_mode='rgb_qk_event_v'):
-        super().__init__()
-        self.qkv_mode = qkv_mode
-        self.temperature = nn.Parameter(torch.ones(1, 1, 1))
-        self.q_img = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.k_img = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.v_img = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.q_event = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.k_event = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.v_event = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-
-    def forward(self, img_feat, event_feat):
-        if self.qkv_mode in ('rgb_qk_event_v', 'rgb_qk_event_v_gate'):
-            q = self.q_img(img_feat)
-            k = self.k_img(img_feat)
-            v = self.v_event(event_feat)
-        elif self.qkv_mode == 'rgb_q_event_kv':
-            q = self.q_img(img_feat)
-            k = self.k_event(event_feat)
-            v = self.v_event(event_feat)
-        else:
-            raise ValueError(f'Unknown qkv_mode: {self.qkv_mode}')
-
-        b, c, h, w = q.shape
-        q = q.view(b, c, -1)
-        k = k.view(b, c, -1)
-        v = v.view(b, c, -1)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.temperature
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v).view(b, c, h, w)
-        return self.proj(out)
-
-
-class WindowCrossAttention2D(nn.Module):
-    def __init__(self, channels, window_size=8, num_heads=4, qkv_mode='rgb_qk_event_v'):
-        super().__init__()
-        if channels % num_heads != 0:
-            raise ValueError(f'channels ({channels}) must be divisible by num_heads ({num_heads})')
-        self.channels = channels
-        self.window_size = window_size
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qkv_mode = qkv_mode
-
-        self.q_img = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.k_img = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.v_img = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.q_event = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.k_event = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.v_event = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-
-    def make_qkv(self, img_feat, event_feat):
-        if self.qkv_mode in ('rgb_qk_event_v', 'rgb_qk_event_v_gate'):
-            return self.q_img(img_feat), self.k_img(img_feat), self.v_event(event_feat)
-        if self.qkv_mode == 'rgb_q_event_kv':
-            return self.q_img(img_feat), self.k_event(event_feat), self.v_event(event_feat)
-        raise ValueError(f'Unknown qkv_mode: {self.qkv_mode}')
-
-    def partition_windows(self, x):
-        b, c, h, w = x.shape
-        ws = self.window_size
-        pad_h = (ws - h % ws) % ws
-        pad_w = (ws - w % ws) % ws
-        x = F.pad(x, (0, pad_w, 0, pad_h))
-        hp, wp = x.shape[-2:]
-        x = x.view(b, c, hp // ws, ws, wp // ws, ws)
-        x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
-        x = x.view(-1, ws * ws, c)
-        return x, (h, w, hp, wp)
-
-    def reverse_windows(self, x, shape_info, batch_size):
-        h, w, hp, wp = shape_info
-        ws = self.window_size
-        x = x.view(batch_size, hp // ws, wp // ws, ws, ws, self.channels)
-        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
-        x = x.view(batch_size, self.channels, hp, wp)
-        return x[:, :, :h, :w]
-
-    def forward(self, img_feat, event_feat):
-        q, k, v = self.make_qkv(img_feat, event_feat)
-        b = q.shape[0]
-        q_windows, shape_info = self.partition_windows(q)
-        k_windows, _ = self.partition_windows(k)
-        v_windows, _ = self.partition_windows(v)
-
-        def split_heads(x):
-            x = x.view(x.shape[0], x.shape[1], self.num_heads, self.head_dim)
-            return x.permute(0, 2, 1, 3)
-
-        q_windows = split_heads(q_windows)
-        k_windows = split_heads(k_windows)
-        v_windows = split_heads(v_windows)
-        attn = torch.matmul(q_windows, k_windows.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v_windows)
-        out = out.permute(0, 2, 1, 3).contiguous().view(out.shape[0], -1, self.channels)
-        out = self.reverse_windows(out, shape_info, b)
-        return self.proj(out)
-
-
-class RGBQEventKVWindowAttention(nn.Module):
-    def __init__(self, channels, window_size=8, num_heads=4, qk_norm=False):
-        super().__init__()
-        if channels % num_heads != 0:
-            raise ValueError(f'channels ({channels}) must be divisible by num_heads ({num_heads})')
-        self.channels = channels
-        self.window_size = window_size
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qk_norm = qk_norm
-
-        self.q_img = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.k_event = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.v_event = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-
-    def partition_windows(self, x):
-        b, c, h, w = x.shape
-        ws = self.window_size
-        pad_h = (ws - h % ws) % ws
-        pad_w = (ws - w % ws) % ws
-        x = F.pad(x, (0, pad_w, 0, pad_h))
-        hp, wp = x.shape[-2:]
-        x = x.view(b, c, hp // ws, ws, wp // ws, ws)
-        x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
-        x = x.view(-1, ws * ws, c)
-        return x, (h, w, hp, wp)
-
-    def reverse_windows(self, x, shape_info, batch_size):
-        h, w, hp, wp = shape_info
-        ws = self.window_size
-        x = x.view(batch_size, hp // ws, wp // ws, ws, ws, self.channels)
-        x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
-        x = x.view(batch_size, self.channels, hp, wp)
-        return x[:, :, :h, :w]
-
-    def forward(self, img_feat, key_feat, value_feat):
-        q = self.q_img(img_feat)
-        k = self.k_event(key_feat)
-        v = self.v_event(value_feat)
-        b = q.shape[0]
-        q_windows, shape_info = self.partition_windows(q)
-        k_windows, _ = self.partition_windows(k)
-        v_windows, _ = self.partition_windows(v)
-
-        def split_heads(x):
-            x = x.view(x.shape[0], x.shape[1], self.num_heads, self.head_dim)
-            return x.permute(0, 2, 1, 3)
-
-        q_windows = split_heads(q_windows)
-        k_windows = split_heads(k_windows)
-        v_windows = split_heads(v_windows)
-        if self.qk_norm:
-            q_windows = F.normalize(q_windows, dim=-1)
-            k_windows = F.normalize(k_windows, dim=-1)
-        attn = torch.matmul(q_windows, k_windows.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v_windows)
-        out = out.permute(0, 2, 1, 3).contiguous().view(out.shape[0], -1, self.channels)
-        out = self.reverse_windows(out, shape_info, b)
-        return self.proj(out)
-
-
-class RGBQEventKVWindowAttention3D(nn.Module):
-    def __init__(self, channels, window_size=8, temporal_window=2, num_heads=4, qk_norm=False):
-        super().__init__()
-        if channels % num_heads != 0:
-            raise ValueError(f'channels ({channels}) must be divisible by num_heads ({num_heads})')
-        self.channels = channels
-        self.window_size = window_size
-        self.temporal_window = temporal_window
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qk_norm = qk_norm
-
-        self.q_img = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.k_event = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.v_event = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-
-    def partition_windows(self, x):
-        b, c, t, h, w = x.shape
-        wt = min(self.temporal_window, t)
-        ws = self.window_size
-        pad_t = (wt - t % wt) % wt
-        pad_h = (ws - h % ws) % ws
-        pad_w = (ws - w % ws) % ws
-        x = F.pad(x, (0, pad_w, 0, pad_h, 0, pad_t))
-        tp, hp, wp = x.shape[-3:]
-        x = x.view(b, c, tp // wt, wt, hp // ws, ws, wp // ws, ws)
-        x = x.permute(0, 2, 4, 6, 3, 5, 7, 1).contiguous()
-        x = x.view(-1, wt * ws * ws, c)
-        return x, (t, h, w, tp, hp, wp, wt, ws)
-
-    def reverse_windows(self, x, shape_info, batch_size):
-        t, h, w, tp, hp, wp, wt, ws = shape_info
-        x = x.view(batch_size, tp // wt, hp // ws, wp // ws, wt, ws, ws, self.channels)
-        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
-        x = x.view(batch_size, self.channels, tp, hp, wp)
-        return x[:, :, :t, :h, :w]
-
-    def forward(self, img_feat, key_feat_3d, value_feat_3d):
-        q_2d = self.q_img(img_feat)
-        k = self.k_event(key_feat_3d)
-        v = self.v_event(value_feat_3d)
-        b, _, t, _, _ = k.shape
-        q = q_2d.unsqueeze(2).expand(-1, -1, t, -1, -1)
-
-        q_windows, shape_info = self.partition_windows(q)
-        k_windows, _ = self.partition_windows(k)
-        v_windows, _ = self.partition_windows(v)
-
-        def split_heads(x):
-            x = x.view(x.shape[0], x.shape[1], self.num_heads, self.head_dim)
-            return x.permute(0, 2, 1, 3)
-
-        q_windows = split_heads(q_windows)
-        k_windows = split_heads(k_windows)
-        v_windows = split_heads(v_windows)
-        if self.qk_norm:
-            q_windows = F.normalize(q_windows, dim=-1)
-            k_windows = F.normalize(k_windows, dim=-1)
-        attn = torch.matmul(q_windows, k_windows.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v_windows)
-        out = out.permute(0, 2, 1, 3).contiguous().view(out.shape[0], -1, self.channels)
-        out = self.reverse_windows(out, shape_info, b)
-        out = out.mean(dim=2)
-        return self.proj(out)
-
-
-class Event3DWindowCrossAttention3D(nn.Module):
-    def __init__(self, channels, window_size=8, temporal_window=2, num_heads=4, qk_norm=False):
-        super().__init__()
-        if channels % num_heads != 0:
-            raise ValueError(f'channels ({channels}) must be divisible by num_heads ({num_heads})')
-        self.channels = channels
-        self.window_size = window_size
-        self.temporal_window = temporal_window
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qk_norm = qk_norm
-        self.q = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.k = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.v = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.proj = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-
-    def partition_windows(self, x):
-        b, c, t, h, w = x.shape
-        wt = min(self.temporal_window, t)
-        ws = self.window_size
-        pad_t = (wt - t % wt) % wt
-        pad_h = (ws - h % ws) % ws
-        pad_w = (ws - w % ws) % ws
-        x = F.pad(x, (0, pad_w, 0, pad_h, 0, pad_t))
-        tp, hp, wp = x.shape[-3:]
-        x = x.view(b, c, tp // wt, wt, hp // ws, ws, wp // ws, ws)
-        x = x.permute(0, 2, 4, 6, 3, 5, 7, 1).contiguous()
-        return x.view(-1, wt * ws * ws, c), (t, h, w, tp, hp, wp, wt, ws)
-
-    def reverse_windows(self, x, shape_info, batch_size):
-        t, h, w, tp, hp, wp, wt, ws = shape_info
-        x = x.view(batch_size, tp // wt, hp // ws, wp // ws, wt, ws, ws, self.channels)
-        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
-        x = x.view(batch_size, self.channels, tp, hp, wp)
-        return x[:, :, :t, :h, :w]
-
-    def forward(self, query_3d, key_3d, value_3d):
-        q = self.q(query_3d)
-        k = self.k(key_3d)
-        v = self.v(value_3d)
-        b = q.shape[0]
-        q_windows, shape_info = self.partition_windows(q)
-        k_windows, _ = self.partition_windows(k)
-        v_windows, _ = self.partition_windows(v)
-
-        def split_heads(x):
-            x = x.view(x.shape[0], x.shape[1], self.num_heads, self.head_dim)
-            return x.permute(0, 2, 1, 3)
-
-        q_windows = split_heads(q_windows)
-        k_windows = split_heads(k_windows)
-        v_windows = split_heads(v_windows)
-        if self.qk_norm:
-            q_windows = F.normalize(q_windows, dim=-1)
-            k_windows = F.normalize(k_windows, dim=-1)
-        attn = torch.matmul(q_windows, k_windows.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v_windows)
-        out = out.permute(0, 2, 1, 3).contiguous().view(out.shape[0], -1, self.channels)
-        out = self.reverse_windows(out, shape_info, b)
-        return self.proj(out)
-
-
-class Event3DQuery2DKeyValueWindowAttention(nn.Module):
-    def __init__(self, channels, window_size=8, temporal_window=2, num_heads=4, qk_norm=False):
-        super().__init__()
-        if channels % num_heads != 0:
-            raise ValueError(f'channels ({channels}) must be divisible by num_heads ({num_heads})')
-        self.channels = channels
-        self.window_size = window_size
-        self.temporal_window = temporal_window
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qk_norm = qk_norm
-        self.q = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.k_2d = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.v_2d = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.proj = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-
-    @staticmethod
-    def expand_2d(x, time_steps):
-        return x.unsqueeze(2).expand(-1, -1, time_steps, -1, -1)
-
-    def partition_windows(self, x):
-        b, c, t, h, w = x.shape
-        wt = min(self.temporal_window, t)
-        ws = self.window_size
-        pad_t = (wt - t % wt) % wt
-        pad_h = (ws - h % ws) % ws
-        pad_w = (ws - w % ws) % ws
-        x = F.pad(x, (0, pad_w, 0, pad_h, 0, pad_t))
-        tp, hp, wp = x.shape[-3:]
-        x = x.view(b, c, tp // wt, wt, hp // ws, ws, wp // ws, ws)
-        x = x.permute(0, 2, 4, 6, 3, 5, 7, 1).contiguous()
-        return x.view(-1, wt * ws * ws, c), (t, h, w, tp, hp, wp, wt, ws)
-
-    def reverse_windows(self, x, shape_info, batch_size):
-        t, h, w, tp, hp, wp, wt, ws = shape_info
-        x = x.view(batch_size, tp // wt, hp // ws, wp // ws, wt, ws, ws, self.channels)
-        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
-        x = x.view(batch_size, self.channels, tp, hp, wp)
-        return x[:, :, :t, :h, :w]
-
-    def forward(self, query_3d, key_2d, value_2d):
-        q = self.q(query_3d)
-        time_steps = q.shape[2]
-        k = self.expand_2d(self.k_2d(key_2d), time_steps)
-        v = self.expand_2d(self.v_2d(value_2d), time_steps)
-        b = q.shape[0]
-        q_windows, shape_info = self.partition_windows(q)
-        k_windows, _ = self.partition_windows(k)
-        v_windows, _ = self.partition_windows(v)
-
-        def split_heads(x):
-            x = x.view(x.shape[0], x.shape[1], self.num_heads, self.head_dim)
-            return x.permute(0, 2, 1, 3)
-
-        q_windows = split_heads(q_windows)
-        k_windows = split_heads(k_windows)
-        v_windows = split_heads(v_windows)
-        if self.qk_norm:
-            q_windows = F.normalize(q_windows, dim=-1)
-            k_windows = F.normalize(k_windows, dim=-1)
-        attn = torch.matmul(q_windows, k_windows.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v_windows)
-        out = out.permute(0, 2, 1, 3).contiguous().view(out.shape[0], -1, self.channels)
-        out = self.reverse_windows(out, shape_info, b)
-        return self.proj(out)
-
-
-class FlexibleTriBranchWindowAttention3D(nn.Module):
-    def __init__(self, channels, window_size=8, temporal_window=2, num_heads=4, qk_norm=False):
-        super().__init__()
-        if channels % num_heads != 0:
-            raise ValueError(f'channels ({channels}) must be divisible by num_heads ({num_heads})')
-        self.channels = channels
-        self.window_size = window_size
-        self.temporal_window = temporal_window
-        self.num_heads = num_heads
-        self.head_dim = channels // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.qk_norm = qk_norm
-
-        self.q_img = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.k_2d = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.v_2d = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-        self.k_3d = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.v_3d = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1, bias=False)
-
-    @staticmethod
-    def expand_2d(x, time_steps):
-        return x.unsqueeze(2).expand(-1, -1, time_steps, -1, -1)
-
-    def partition_windows(self, x):
-        b, c, t, h, w = x.shape
-        wt = min(self.temporal_window, t)
-        ws = self.window_size
-        pad_t = (wt - t % wt) % wt
-        pad_h = (ws - h % ws) % ws
-        pad_w = (ws - w % ws) % ws
-        x = F.pad(x, (0, pad_w, 0, pad_h, 0, pad_t))
-        tp, hp, wp = x.shape[-3:]
-        x = x.view(b, c, tp // wt, wt, hp // ws, ws, wp // ws, ws)
-        x = x.permute(0, 2, 4, 6, 3, 5, 7, 1).contiguous()
-        return x.view(-1, wt * ws * ws, c), (t, h, w, tp, hp, wp, wt, ws)
-
-    def reverse_windows(self, x, shape_info, batch_size):
-        t, h, w, tp, hp, wp, wt, ws = shape_info
-        x = x.view(batch_size, tp // wt, hp // ws, wp // ws, wt, ws, ws, self.channels)
-        x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous()
-        x = x.view(batch_size, self.channels, tp, hp, wp)
-        return x[:, :, :t, :h, :w]
-
-    def forward(self, img_feat, key_2d=None, value_2d=None, key_3d=None, value_3d=None):
-        if key_3d is not None:
-            time_steps = key_3d.shape[2]
-        elif value_3d is not None:
-            time_steps = value_3d.shape[2]
-        else:
-            time_steps = self.temporal_window
-
-        q = self.expand_2d(self.q_img(img_feat), time_steps)
-        if key_3d is not None:
-            k = self.k_3d(key_3d)
-        elif key_2d is not None:
-            k = self.expand_2d(self.k_2d(key_2d), time_steps)
-        else:
-            raise ValueError('A 2D or 3D key feature is required.')
-
-        if value_3d is not None:
-            v = self.v_3d(value_3d)
-        elif value_2d is not None:
-            v = self.expand_2d(self.v_2d(value_2d), time_steps)
-        else:
-            raise ValueError('A 2D or 3D value feature is required.')
-
-        b = q.shape[0]
-        q_windows, shape_info = self.partition_windows(q)
-        k_windows, _ = self.partition_windows(k)
-        v_windows, _ = self.partition_windows(v)
-
-        def split_heads(x):
-            x = x.view(x.shape[0], x.shape[1], self.num_heads, self.head_dim)
-            return x.permute(0, 2, 1, 3)
-
-        q_windows = split_heads(q_windows)
-        k_windows = split_heads(k_windows)
-        v_windows = split_heads(v_windows)
-        if self.qk_norm:
-            q_windows = F.normalize(q_windows, dim=-1)
-            k_windows = F.normalize(k_windows, dim=-1)
-        attn = torch.matmul(q_windows, k_windows.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v_windows)
-        out = out.permute(0, 2, 1, 3).contiguous().view(out.shape[0], -1, self.channels)
-        out = self.reverse_windows(out, shape_info, b)
-        return self.proj(out.mean(dim=2))
-
-
-class TriBranchStageFusion(nn.Module):
     def __init__(
         self,
         channels,
-        fusion_mode='qkv_2d_k_3d_v',
-        fusion_dim='3d',
-        window_size=8,
-        temporal_window=2,
-        num_heads=4,
-        qk_norm=False,
-        gamma_init=0.1,
+        fusion_mode,
+        fusion_dim,
+        single_ca_order,
+        cascaded_ca_order,
+        cross_window_size,
+        temporal_window_size,
+        num_heads,
+        qk_norm,
+        gamma_init,
     ):
         super().__init__()
         self.fusion_mode = fusion_mode.lower()
         self.fusion_dim = fusion_dim.lower()
-        if self.fusion_dim not in ('2d', '3d'):
-            raise ValueError(f'Unknown stage fusion dim: {fusion_dim}')
-        self.event_merge = ConvBlock2D(channels * 2, channels)
-        self.cat_fusion = nn.Sequential(
-            ConvBlock2D(channels * 3, channels),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
-        )
-        self.attn = FlexibleTriBranchWindowAttention3D(
-            channels,
-            window_size=window_size,
-            temporal_window=temporal_window,
-            num_heads=num_heads,
-            qk_norm=qk_norm,
-        )
-        self.attn2d = RGBQEventKVWindowAttention(
-            channels,
-            window_size=window_size,
-            num_heads=num_heads,
-            qk_norm=qk_norm,
-        )
-        self.inject = nn.Sequential(
-            ConvBlock2D(channels, channels),
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
-        )
-        self.norm_img = nn.GroupNorm(1, channels)
-        self.norm_event2d = nn.GroupNorm(1, channels)
-        self.norm_event3d = nn.GroupNorm(1, channels)
-        self.norm_fused = nn.GroupNorm(1, channels)
+        self.single_ca_order = single_ca_order.lower()
+        self.cascaded_ca_order = cascaded_ca_order.lower()
+        if self.fusion_mode not in {"cat", "single_ca", "cascaded_ca"}:
+            raise ValueError(f"Unknown fusion_mode: {fusion_mode}")
+        if self.fusion_dim not in {"2d", "3d"}:
+            raise ValueError(f"Unknown fusion_dim: {fusion_dim}")
+        if self.single_ca_order not in self.SINGLE_ORDERS:
+            raise ValueError(f"Unknown single_ca_order: {single_ca_order}")
+        if self.cascaded_ca_order not in self.CASCADE_ORDERS:
+            raise ValueError(f"Unknown cascaded_ca_order: {cascaded_ca_order}")
+
+        if self.fusion_mode == "cat":
+            if self.fusion_dim == "2d":
+                self.cat = nn.Sequential(ConvBlock2D(channels * 3, channels), nn.Conv2d(channels, channels, 3, padding=1))
+            else:
+                self.cat = nn.Sequential(
+                    nn.Conv3d(channels * 3, channels, 1),
+                    nn.GELU(),
+                    nn.Conv3d(channels, channels, 3, padding=1, groups=channels),
+                    nn.GELU(),
+                    nn.Conv3d(channels, channels, 1),
+                )
+        elif self.fusion_dim == "2d":
+            self.ca = WindowCrossAttention2D(channels, cross_window_size, num_heads, qk_norm)
+            self.inject1 = nn.Conv2d(channels, channels, 3, padding=1)
+            if self.fusion_mode == "cascaded_ca":
+                self.inject2 = nn.Conv2d(channels, channels, 3, padding=1)
+        else:
+            self.ca = WindowCrossAttention3D(
+                channels, cross_window_size, temporal_window_size, num_heads, qk_norm
+            )
+            self.inject1 = nn.Conv3d(channels, channels, 3, padding=1)
+            if self.fusion_mode == "cascaded_ca":
+                self.inject2 = nn.Conv3d(channels, channels, 3, padding=1)
+
+        self.gamma1 = nn.Parameter(torch.ones(1) * gamma_init)
+        if self.fusion_mode == "cascaded_ca":
+            self.gamma2 = nn.Parameter(torch.ones(1) * gamma_init)
+        self.norm_ffn = ChannelLayerNorm2D(channels)
         self.ffn = ConvFFN2D(channels)
-        self.gamma_attn = nn.Parameter(torch.ones(1) * gamma_init)
         self.gamma_ffn = nn.Parameter(torch.ones(1) * gamma_init)
 
-    def forward(self, img_feat, event2d_feat, fused3d_feat):
-        mode = self.fusion_mode
-        img_for_attn = self.norm_img(img_feat)
-        event2d_for_attn = self.norm_event2d(event2d_feat)
-        fused3d_2d = fused3d_feat.mean(dim=2)
-        fused3d_2d_for_merge = self.norm_event3d(fused3d_2d)
+    @staticmethod
+    def expand_time(x, time_steps):
+        return x.unsqueeze(2).expand(-1, -1, time_steps, -1, -1)
 
-        if mode in ('cat', 'concat'):
-            delta = self.cat_fusion(torch.cat([img_feat, event2d_feat, fused3d_2d], dim=1))
-        elif mode in ('qkv_2d_k_3d_v', 'a', '3d_qkv'):
-            if self.fusion_dim == '3d':
-                delta = self.attn(
-                    img_for_attn,
-                    key_2d=event2d_for_attn,
-                    value_3d=fused3d_feat,
-                )
-            else:
-                delta = self.attn2d(img_for_attn, key_feat=event2d_for_attn, value_feat=fused3d_2d_for_merge)
-        elif mode in ('qkv_3d_k_2d_v', 'b'):
-            if self.fusion_dim == '3d':
-                delta = self.attn(
-                    img_for_attn,
-                    key_3d=fused3d_feat,
-                    value_2d=event2d_for_attn,
-                )
-            else:
-                delta = self.attn2d(img_for_attn, key_feat=fused3d_2d_for_merge, value_feat=event2d_for_attn)
-        elif mode in ('qkv_merged', 'c'):
-            merged = self.event_merge(torch.cat([event2d_for_attn, fused3d_2d_for_merge], dim=1))
-            if self.fusion_dim == '3d':
-                delta = self.attn(img_for_attn, key_2d=merged, value_2d=merged)
-            else:
-                delta = self.attn2d(img_for_attn, key_feat=merged, value_feat=merged)
-        elif mode in ('qkv_3d_only', 'gated3d_only'):
-            if self.fusion_dim == '3d':
-                delta = self.attn(img_for_attn, key_3d=fused3d_feat, value_3d=fused3d_feat)
-            else:
-                delta = self.attn2d(img_for_attn, key_feat=fused3d_2d_for_merge, value_feat=fused3d_2d_for_merge)
-        elif mode in ('qkv_2d_only', 'event2d_only'):
-            if self.fusion_dim == '3d':
-                delta = self.attn(img_for_attn, key_2d=event2d_for_attn, value_2d=event2d_for_attn)
-            else:
-                delta = self.attn2d(img_for_attn, key_feat=event2d_for_attn, value_feat=event2d_for_attn)
+    def single_2d(self, rgb, event2d, event3d):
+        event3d = event3d.mean(dim=2)
+        if self.single_ca_order == "event2d_k_event3d_v":
+            delta = self.ca(rgb, event2d, event3d)
         else:
-            raise ValueError(f'Unknown stage fusion mode: {self.fusion_mode}')
+            delta = self.ca(rgb, event3d, event2d)
+        return rgb + self.gamma1 * self.inject1(delta)
 
-        fused = img_feat + self.gamma_attn * self.inject(delta)
-        return fused + self.gamma_ffn * self.ffn(self.norm_fused(fused))
+    def cascade_2d(self, rgb, event2d, event3d):
+        event3d = event3d.mean(dim=2)
+        if self.cascaded_ca_order == "motion_then_struct":
+            x = rgb + self.gamma1 * self.inject1(self.ca(rgb, event3d, event3d))
+            return x + self.gamma2 * self.inject2(self.ca(x, event2d, event2d))
+        if self.cascaded_ca_order == "struct_then_motion":
+            x = rgb + self.gamma1 * self.inject1(self.ca(rgb, event2d, event2d))
+            return x + self.gamma2 * self.inject2(self.ca(x, event3d, event3d))
+        event = event3d + self.gamma1 * self.inject1(self.ca(event3d, event2d, event2d))
+        return rgb + self.gamma2 * self.inject2(self.ca(rgb, event, event))
+
+    def single_3d(self, rgb, event2d, event3d):
+        time_steps = event3d.shape[2]
+        rgb = self.expand_time(rgb, time_steps)
+        event2d = self.expand_time(event2d, time_steps)
+        if self.single_ca_order == "event2d_k_event3d_v":
+            delta = self.ca(rgb, event2d, event3d)
+        else:
+            delta = self.ca(rgb, event3d, event2d)
+        return (rgb + self.gamma1 * self.inject1(delta)).mean(dim=2)
+
+    def cascade_3d(self, rgb, event2d, event3d):
+        time_steps = event3d.shape[2]
+        rgb = self.expand_time(rgb, time_steps)
+        event2d = self.expand_time(event2d, time_steps)
+        if self.cascaded_ca_order == "motion_then_struct":
+            x = rgb + self.gamma1 * self.inject1(self.ca(rgb, event3d, event3d))
+            x = x + self.gamma2 * self.inject2(self.ca(x, event2d, event2d))
+        elif self.cascaded_ca_order == "struct_then_motion":
+            x = rgb + self.gamma1 * self.inject1(self.ca(rgb, event2d, event2d))
+            x = x + self.gamma2 * self.inject2(self.ca(x, event3d, event3d))
+        else:
+            event = event3d + self.gamma1 * self.inject1(self.ca(event3d, event2d, event2d))
+            x = rgb + self.gamma2 * self.inject2(self.ca(rgb, event, event))
+        return x.mean(dim=2)
+
+    def forward(self, rgb, event2d, event3d):
+        if self.fusion_mode == "cat":
+            if self.fusion_dim == "2d":
+                delta = self.cat(torch.cat([rgb, event2d, event3d.mean(dim=2)], dim=1))
+            else:
+                time_steps = event3d.shape[2]
+                rgb3d = self.expand_time(rgb, time_steps)
+                event2d3d = self.expand_time(event2d, time_steps)
+                delta = self.cat(torch.cat([rgb3d, event2d3d, event3d], dim=1)).mean(dim=2)
+            fused = rgb + self.gamma1 * delta
+        elif self.fusion_dim == "2d":
+            fused = self.single_2d(rgb, event2d, event3d) if self.fusion_mode == "single_ca" else self.cascade_2d(rgb, event2d, event3d)
+        else:
+            fused = self.single_3d(rgb, event2d, event3d) if self.fusion_mode == "single_ca" else self.cascade_3d(rgb, event2d, event3d)
+        return fused + self.gamma_ffn * self.ffn(self.norm_ffn(fused))
 
 
-class CascadedCrossAttentionStageFusion(nn.Module):
+class ThreeBranchProgressiveDeblurNet(nn.Module):
     def __init__(
         self,
-        channels,
-        internal_3d_ca_mode='tdc_query',
-        cascaded_ca_order='motion_then_struct',
-        event_fusion_dim='3d',
-        window_size=8,
-        temporal_window=2,
+        rgb_in=3,
+        event_in=6,
+        base_dim=32,
+        fusion_mode="single_ca",
+        fusion_dim="2d",
+        single_ca_order="event2d_k_event3d_v",
+        cascaded_ca_order="motion_then_struct",
+        self_attn_window_size=8,
+        cross_attn_window_size=8,
+        temporal_window_size=2,
         num_heads=4,
         qk_norm=False,
         gamma_init=0.1,
     ):
         super().__init__()
-        self.internal_3d_ca_mode = internal_3d_ca_mode.lower()
-        self.cascaded_ca_order = cascaded_ca_order.lower()
-        self.event_fusion_dim = event_fusion_dim.lower()
-        if self.internal_3d_ca_mode not in ('tdc_query', 'e3d_query', 'cat'):
-            raise ValueError(f'Unknown internal_3d_ca_mode: {internal_3d_ca_mode}')
-        if self.cascaded_ca_order not in ('motion_then_struct', 'struct_then_motion', 'event_then_rgb'):
-            raise ValueError(f'Unknown cascaded_ca_order: {cascaded_ca_order}')
-        if self.event_fusion_dim not in ('2d', '3d'):
-            raise ValueError(f'Unknown event_fusion_dim: {event_fusion_dim}')
-
-        self.norm_img = nn.GroupNorm(1, channels)
-        self.norm_event2d = nn.GroupNorm(1, channels)
-        self.norm_e3d = nn.GroupNorm(1, channels)
-        self.norm_tdc3d = nn.GroupNorm(1, channels)
-        self.norm_f3d = nn.GroupNorm(1, channels)
-        self.norm_event2d_after = nn.GroupNorm(1, channels)
-        self.norm_img_after = nn.GroupNorm(1, channels)
-
-        self.internal_3d_attn = Event3DWindowCrossAttention3D(
-            channels,
-            window_size=window_size,
-            temporal_window=temporal_window,
-            num_heads=num_heads,
-            qk_norm=qk_norm,
-        )
-        self.event2d_to_3d_attn = Event3DQuery2DKeyValueWindowAttention(
-            channels,
-            window_size=window_size,
-            temporal_window=temporal_window,
-            num_heads=num_heads,
-            qk_norm=qk_norm,
-        )
-        self.rgb_to_3d_attn = RGBQEventKVWindowAttention3D(
-            channels,
-            window_size=window_size,
-            temporal_window=temporal_window,
-            num_heads=num_heads,
-            qk_norm=qk_norm,
-        )
-        self.rgb_to_2d_attn = RGBQEventKVWindowAttention(
-            channels,
-            window_size=window_size,
-            num_heads=num_heads,
-            qk_norm=qk_norm,
-        )
-        self.f3d_cat = nn.Sequential(
-            nn.Conv3d(channels * 2, channels, kernel_size=1),
-            nn.GELU(),
-            nn.Conv3d(channels, channels, kernel_size=3, padding=1, groups=channels),
-            nn.GELU(),
-            nn.Conv3d(channels, channels, kernel_size=1),
-        )
-        self.event_merge_2d = ConvBlock2D(channels * 2, channels)
-        self.inject_motion = nn.Sequential(ConvBlock2D(channels, channels), nn.Conv2d(channels, channels, kernel_size=3, padding=1))
-        self.inject_struct = nn.Sequential(ConvBlock2D(channels, channels), nn.Conv2d(channels, channels, kernel_size=3, padding=1))
-        self.inject_event = nn.Sequential(ConvBlock2D(channels, channels), nn.Conv2d(channels, channels, kernel_size=3, padding=1))
-        self.ffn = ConvFFN2D(channels)
-
-        self.gamma_internal = nn.Parameter(torch.ones(1) * gamma_init)
-        self.gamma_motion = nn.Parameter(torch.ones(1) * gamma_init)
-        self.gamma_struct = nn.Parameter(torch.ones(1) * gamma_init)
-        self.gamma_event = nn.Parameter(torch.ones(1) * gamma_init)
-        self.gamma_ffn = nn.Parameter(torch.ones(1) * gamma_init)
-
-    def fuse_3d_event(self, e3d_feat, tdc3d_feat):
-        e3d_feat = self.norm_e3d(e3d_feat)
-        tdc3d_feat = self.norm_tdc3d(tdc3d_feat)
-        if self.internal_3d_ca_mode == 'tdc_query':
-            delta = self.internal_3d_attn(tdc3d_feat, e3d_feat, e3d_feat)
-            return tdc3d_feat + self.gamma_internal * delta
-        if self.internal_3d_ca_mode == 'e3d_query':
-            delta = self.internal_3d_attn(e3d_feat, tdc3d_feat, tdc3d_feat)
-            return e3d_feat + self.gamma_internal * delta
-        return self.f3d_cat(torch.cat([e3d_feat, tdc3d_feat], dim=1))
-
-    def fuse_event_then_rgb(self, img_feat, event2d_feat, f3d_feat):
-        img_base = img_feat
-        event2d_feat = self.norm_event2d(event2d_feat)
-        f3d_feat = self.norm_f3d(f3d_feat)
-        if self.event_fusion_dim == '3d':
-            event_delta_3d = self.event2d_to_3d_attn(f3d_feat, event2d_feat, event2d_feat)
-            event_feat_3d = f3d_feat + self.gamma_event * event_delta_3d
-            motion_delta = self.rgb_to_3d_attn(self.norm_img(img_feat), event_feat_3d, event_feat_3d)
-            fused = img_base + self.gamma_motion * self.inject_motion(motion_delta)
-        else:
-            f3d_2d = f3d_feat.mean(dim=2)
-            event_feat_2d = self.event_merge_2d(torch.cat([f3d_2d, event2d_feat], dim=1))
-            event_delta = self.rgb_to_2d_attn(self.norm_img(img_feat), event_feat_2d, event_feat_2d)
-            fused = img_base + self.gamma_event * self.inject_event(event_delta)
-        return fused + self.gamma_ffn * self.ffn(self.norm_img_after(fused))
-
-    def forward(self, img_feat, event2d_feat, event3d_feat, tdc3d_feat):
-        f3d_feat = self.fuse_3d_event(event3d_feat, tdc3d_feat)
-        img_base = img_feat
-        img_for_attn = self.norm_img(img_feat)
-        event2d_feat = self.norm_event2d_after(event2d_feat)
-
-        if self.cascaded_ca_order == 'motion_then_struct':
-            motion_delta = self.rgb_to_3d_attn(img_for_attn, f3d_feat, f3d_feat)
-            img_motion = img_base + self.gamma_motion * self.inject_motion(motion_delta)
-            struct_delta = self.rgb_to_2d_attn(self.norm_img_after(img_motion), event2d_feat, event2d_feat)
-            fused = img_motion + self.gamma_struct * self.inject_struct(struct_delta)
-        elif self.cascaded_ca_order == 'struct_then_motion':
-            struct_delta = self.rgb_to_2d_attn(img_for_attn, event2d_feat, event2d_feat)
-            img_struct = img_base + self.gamma_struct * self.inject_struct(struct_delta)
-            motion_delta = self.rgb_to_3d_attn(self.norm_img_after(img_struct), f3d_feat, f3d_feat)
-            fused = img_struct + self.gamma_motion * self.inject_motion(motion_delta)
-        else:
-            fused = self.fuse_event_then_rgb(img_base, event2d_feat, f3d_feat)
-            return fused
-        return fused + self.gamma_ffn * self.ffn(self.norm_img_after(fused))
-
-
-class FusionBlock(nn.Module):
-    def __init__(self, channels, fusion_op='cat_gate', qkv_mode='rgb_qk_event_v', window_size=8, num_heads=4):
-        super().__init__()
-        self.fusion_op = fusion_op
-        self.qkv_mode = qkv_mode
-        self.gate = EventGate(channels)
-        if fusion_op == 'window':
-            self.attn = WindowCrossAttention2D(channels, window_size=window_size, num_heads=num_heads, qkv_mode=qkv_mode)
-        elif fusion_op == 'channel':
-            self.attn = ChannelCrossAttention2D(channels, qkv_mode=qkv_mode)
-        elif fusion_op == 'cat_gate':
-            self.attn = None
-        else:
-            raise ValueError(f'Unknown fusion_op: {fusion_op}')
-        self.out = ConvBlock2D(channels * 2, channels)
-
-    def forward(self, img_feat, event_feat):
-        gate = self.gate(event_feat)
-        if self.attn is None:
-            event_out = gate * event_feat
-        else:
-            event_out = self.attn(img_feat, event_feat)
-            if self.qkv_mode == 'rgb_qk_event_v_gate':
-                event_out = gate * event_out
-        return self.out(torch.cat([img_feat, event_out], dim=1))
-
-
-class MultiScaleTDCEventDeblurNet(nn.Module):
-    def __init__(
-        self,
-        rgb_in=3,
-        event_in=6,
-        base_dim=32,
-        fusion_type='hybrid',
-        qkv_mode='rgb_qk_event_v',
-        window_size=8,
-        num_heads=4,
-    ):
-        super().__init__()
         dims = [base_dim, base_dim * 2, base_dim * 4]
-        fusion_ops = self.resolve_fusion_ops(fusion_type)
-        self.image_encoder = ThreeScaleImageEncoder(rgb_in=rgb_in, base_dim=base_dim)
-        self.event_encoder = DualEventEncoder(event_in=event_in, base_dim=base_dim)
+        self.rgb_stem = ConvBlock2D(rgb_in, dims[0])
+        self.event2d_stem = ConvBlock2D(event_in, dims[0])
+        self.event3d_stem = ShortTermTDCBlock3D(1, dims[0])
+        self.rgb_down = nn.ModuleList([ConvBlock2D(dims[i], dims[i + 1], stride=2) for i in range(2)])
+        self.event2d_down = nn.ModuleList([ConvBlock2D(dims[i], dims[i + 1], stride=2) for i in range(2)])
+        self.event3d_down = nn.ModuleList([
+            ShortTermTDCBlock3D(dims[i], dims[i + 1], stride=(1, 2, 2)) for i in range(2)
+        ])
+        self.rgb_self_attn = nn.ModuleList([
+            WindowSelfAttention2D(dim, self_attn_window_size, num_heads, qk_norm) for dim in dims
+        ])
+        self.event2d_self_attn = nn.ModuleList([
+            WindowSelfAttention2D(dim, self_attn_window_size, num_heads, qk_norm) for dim in dims
+        ])
+        self.event3d_self_attn = nn.ModuleList([
+            WindowSelfAttention3D(dim, self_attn_window_size, temporal_window_size, num_heads, qk_norm)
+            for dim in dims
+        ])
         self.fusions = nn.ModuleList([
-            FusionBlock(dim, op, qkv_mode=qkv_mode, window_size=window_size, num_heads=num_heads)
-            for dim, op in zip(dims, fusion_ops)
+            ThreeBranchStageFusion(
+                dim,
+                fusion_mode,
+                fusion_dim,
+                single_ca_order,
+                cascaded_ca_order,
+                cross_attn_window_size,
+                temporal_window_size,
+                num_heads,
+                qk_norm,
+                gamma_init,
+            )
+            for dim in dims
         ])
         self.up1 = UpBlock(dims[2], dims[1], dims[1])
         self.up0 = UpBlock(dims[1], dims[0], dims[0])
-        self.reconstruct = nn.Sequential(
-            ConvBlock2D(dims[0], dims[0]),
-            nn.Conv2d(dims[0], rgb_in, kernel_size=3, padding=1),
-        )
+        self.reconstruct = nn.Sequential(ConvBlock2D(dims[0], dims[0]), nn.Conv2d(dims[0], rgb_in, 3, padding=1))
 
-    @staticmethod
-    def resolve_fusion_ops(fusion_type):
-        fusion_type = fusion_type.lower()
-        if fusion_type == 'hybrid':
-            return ['cat_gate', 'cat_gate', 'window']
-        if fusion_type == 'channel_window':
-            return ['cat_gate', 'channel', 'window']
-        if fusion_type == 'window_all':
-            return ['window', 'window', 'window']
-        if fusion_type == 'cat_all':
-            return ['cat_gate', 'cat_gate', 'cat_gate']
-        raise ValueError(f'Unknown fusion_type: {fusion_type}')
+    def attend(self, scale, rgb, event2d, event3d):
+        return (
+            self.rgb_self_attn[scale](rgb),
+            self.event2d_self_attn[scale](event2d),
+            self.event3d_self_attn[scale](event3d),
+        )
 
     def forward(self, blur, event):
-        img_feats = self.image_encoder(blur)
-        event_feats = self.event_encoder(event)
-        fused = [
-            fusion(img_feat, event_feat)
-            for fusion, img_feat, event_feat in zip(self.fusions, img_feats, event_feats)
-        ]
-        x = self.up1(fused[2], fused[1])
-        x = self.up0(x, fused[0])
-        residual = self.reconstruct(x)
-        return residual + blur
+        rgb = self.rgb_stem(blur)
+        event2d = self.event2d_stem(event)
+        event3d = self.event3d_stem(event.unsqueeze(1))
+        rgb, event2d, event3d = self.attend(0, rgb, event2d, event3d)
+        fused0 = self.fusions[0](rgb, event2d, event3d)
 
+        rgb = self.rgb_down[0](fused0)
+        event2d = self.event2d_down[0](event2d)
+        event3d = self.event3d_down[0](event3d)
+        rgb, event2d, event3d = self.attend(1, rgb, event2d, event3d)
+        fused1 = self.fusions[1](rgb, event2d, event3d)
 
-class StagedTriBranchDeblurNet(nn.Module):
-    def __init__(
-        self,
-        rgb_in=3,
-        event_in=6,
-        base_dim=32,
-        progressive_scales=True,
-        fusion_family='gated',
-        stage_fusion_mode='qkv_2d_k_3d_v',
-        stage_fusion_dim='3d',
-        internal_3d_ca_mode='tdc_query',
-        cascaded_ca_order='motion_then_struct',
-        event_fusion_dim='3d',
-        window_size=8,
-        temporal_window=2,
-        num_heads=4,
-        qk_norm=False,
-        gated_3devent_base='tdc',
-        gated_3devent_gate='cbam3d',
-        gated_3devent_delta='dual_conv_residual',
-        gamma_init=0.0,
-        event_inject_gamma_init=0.1,
-        use_rgb_self_attn_h4=True,
-        use_event2d_self_attn_h4=True,
-        use_event3d_self_attn_h4=True,
-    ):
-        super().__init__()
-        if gated_3devent_delta.lower() != 'dual_conv_residual':
-            raise ValueError(f'Unknown gated_3devent_delta: {gated_3devent_delta}')
-        self.progressive_scales = progressive_scales
-        self.fusion_family = fusion_family.lower()
-        if self.fusion_family not in ('gated', 'cascaded_ca', 'cascaded_cross_attention'):
-            raise ValueError(f'Unknown fusion_family: {fusion_family}')
-        self.stage_fusion_mode = stage_fusion_mode.lower()
-        self.stage_fusion_dim = stage_fusion_dim.lower()
-        self.use_rgb_self_attn = use_rgb_self_attn_h4
-        self.use_event2d_self_attn = use_event2d_self_attn_h4
-        self.use_event3d_self_attn = use_event3d_self_attn_h4
-        dims = [base_dim, base_dim * 2, base_dim * 4]
-
-        self.image_encoder = ThreeScaleImageEncoder(rgb_in=rgb_in, base_dim=base_dim)
-        self.event2d_encoder = EventVoxel2DEncoder(event_in=event_in, base_dim=base_dim)
-        self.event3d_encoder = EventVoxel3DEncoder(base_dim=base_dim)
-        self.tdc3d_encoder = EventTDC3DEncoder(base_dim=base_dim)
-
-        self.rgb_self_attns = nn.ModuleList([
-            WindowSelfAttention2D(
-                dim,
-                window_size=window_size,
-                num_heads=num_heads,
-                qk_norm=qk_norm,
-            )
-            for dim in dims
-        ])
-        self.event2d_self_attns = nn.ModuleList([
-            WindowSelfAttention2D(
-                dim,
-                window_size=window_size,
-                num_heads=num_heads,
-                qk_norm=qk_norm,
-            )
-            for dim in dims
-        ])
-        self.event3d_self_attns = nn.ModuleList([
-            WindowSelfAttention3D(
-                dim,
-                window_size=window_size,
-                temporal_window=temporal_window,
-                num_heads=num_heads,
-                qk_norm=qk_norm,
-            )
-            for dim in dims
-        ])
-        self.tdc3d_self_attns = nn.ModuleList([
-            WindowSelfAttention3D(
-                dim,
-                window_size=window_size,
-                temporal_window=temporal_window,
-                num_heads=num_heads,
-                qk_norm=qk_norm,
-            )
-            for dim in dims
-        ])
-        self.gated_3devent_fusions = nn.ModuleList([
-            Gated3DEventFusion(
-                dim,
-                base=gated_3devent_base,
-                gate=gated_3devent_gate,
-                gamma_init=gamma_init,
-            )
-            for dim in dims
-        ])
-        if self.fusion_family == 'gated':
-            self.stage_fusions = nn.ModuleList([
-                TriBranchStageFusion(
-                    dim,
-                    fusion_mode=stage_fusion_mode,
-                    fusion_dim=stage_fusion_dim,
-                    window_size=window_size,
-                    temporal_window=temporal_window,
-                    num_heads=num_heads,
-                    qk_norm=qk_norm,
-                    gamma_init=event_inject_gamma_init,
-                )
-                for dim in dims
-            ])
-        else:
-            self.stage_fusions = nn.ModuleList([
-                CascadedCrossAttentionStageFusion(
-                    dim,
-                    internal_3d_ca_mode=internal_3d_ca_mode,
-                    cascaded_ca_order=cascaded_ca_order,
-                    event_fusion_dim=event_fusion_dim,
-                    window_size=window_size,
-                    temporal_window=temporal_window,
-                    num_heads=num_heads,
-                    qk_norm=qk_norm,
-                    gamma_init=event_inject_gamma_init,
-                )
-                for dim in dims
-            ])
-        self.up1 = UpBlock(dims[2], dims[1], dims[1])
-        self.up0 = UpBlock(dims[1], dims[0], dims[0])
-        self.reconstruct = nn.Sequential(
-            ConvBlock2D(dims[0], dims[0]),
-            nn.Conv2d(dims[0], rgb_in, kernel_size=3, padding=1),
-        )
-
-    def apply_stage_attention(self, scale_idx, img_feat, event2d_feat, event3d_feat, tdc3d_feat):
-        if self.use_rgb_self_attn:
-            img_feat = self.rgb_self_attns[scale_idx](img_feat)
-        if self.use_event2d_self_attn:
-            event2d_feat = self.event2d_self_attns[scale_idx](event2d_feat)
-        if self.use_event3d_self_attn:
-            event3d_feat = self.event3d_self_attns[scale_idx](event3d_feat)
-            tdc3d_feat = self.tdc3d_self_attns[scale_idx](tdc3d_feat)
-        return img_feat, event2d_feat, event3d_feat, tdc3d_feat
-
-    def fuse_stage(self, scale_idx, img_feat, event2d_feat, event3d_feat, tdc3d_feat):
-        if self.fusion_family == 'gated':
-            fused3d = self.gated_3devent_fusions[scale_idx](event3d_feat, tdc3d_feat)
-            return self.stage_fusions[scale_idx](img_feat, event2d_feat, fused3d)
-        return self.stage_fusions[scale_idx](img_feat, event2d_feat, event3d_feat, tdc3d_feat)
-
-    def forward(self, blur, event):
-        event_3d_input = event.unsqueeze(1)
-
-        img0 = self.image_encoder.enc0(blur)
-        event2d0 = self.event2d_encoder.enc0(event)
-        event3d0 = self.event3d_encoder.stem(event_3d_input)
-        tdc3d0 = self.tdc3d_encoder.stem(event_3d_input)
-
-        if not self.progressive_scales:
-            img1 = self.image_encoder.enc1(img0)
-            event2d1 = self.event2d_encoder.enc1(event2d0)
-            event3d1 = self.event3d_encoder.down1(event3d0)
-            tdc3d1 = self.tdc3d_encoder.down1(tdc3d0)
-
-            img2 = self.image_encoder.enc2(img1)
-            event2d2 = self.event2d_encoder.enc2(event2d1)
-            event3d2 = self.event3d_encoder.down2(event3d1)
-            tdc3d2 = self.tdc3d_encoder.down2(tdc3d1)
-
-            img0, event2d0, event3d0, tdc3d0 = self.apply_stage_attention(0, img0, event2d0, event3d0, tdc3d0)
-            img1, event2d1, event3d1, tdc3d1 = self.apply_stage_attention(1, img1, event2d1, event3d1, tdc3d1)
-            img2, event2d2, event3d2, tdc3d2 = self.apply_stage_attention(2, img2, event2d2, event3d2, tdc3d2)
-
-            fused0 = self.fuse_stage(0, img0, event2d0, event3d0, tdc3d0)
-            fused1 = self.fuse_stage(1, img1, event2d1, event3d1, tdc3d1)
-            fused2 = self.fuse_stage(2, img2, event2d2, event3d2, tdc3d2)
-            x = self.up1(fused2, fused1)
-            x = self.up0(x, fused0)
-            residual = self.reconstruct(x)
-            return residual + blur
-
-        img0, event2d0, event3d0, tdc3d0 = self.apply_stage_attention(
-            0,
-            img0,
-            event2d0,
-            event3d0,
-            tdc3d0,
-        )
-        fused0 = self.fuse_stage(0, img0, event2d0, event3d0, tdc3d0)
-
-        img1 = self.image_encoder.enc1(fused0)
-        event2d1 = self.event2d_encoder.enc1(event2d0)
-        event3d1 = self.event3d_encoder.down1(event3d0)
-        tdc3d1 = self.tdc3d_encoder.down1(tdc3d0)
-        img1, event2d1, event3d1, tdc3d1 = self.apply_stage_attention(
-            1,
-            img1,
-            event2d1,
-            event3d1,
-            tdc3d1,
-        )
-        fused1 = self.fuse_stage(1, img1, event2d1, event3d1, tdc3d1)
-
-        img2 = self.image_encoder.enc2(fused1)
-        event2d2 = self.event2d_encoder.enc2(event2d1)
-        event3d2 = self.event3d_encoder.down2(event3d1)
-        tdc3d2 = self.tdc3d_encoder.down2(tdc3d1)
-        img2, event2d2, event3d2, tdc3d2 = self.apply_stage_attention(
-            2,
-            img2,
-            event2d2,
-            event3d2,
-            tdc3d2,
-        )
-        fused2 = self.fuse_stage(2, img2, event2d2, event3d2, tdc3d2)
+        rgb = self.rgb_down[1](fused1)
+        event2d = self.event2d_down[1](event2d)
+        event3d = self.event3d_down[1](event3d)
+        rgb, event2d, event3d = self.attend(2, rgb, event2d, event3d)
+        fused2 = self.fusions[2](rgb, event2d, event3d)
 
         x = self.up1(fused2, fused1)
         x = self.up0(x, fused0)
-        residual = self.reconstruct(x)
-        return residual + blur
+        return blur + self.reconstruct(x)
 
 
-class LateFusionTDCEventDeblurNet(nn.Module):
-    def __init__(
-        self,
-        rgb_in=3,
-        event_in=6,
-        base_dim=32,
-        late_fusion_mode='kv_2d_k_tdc_v',
-        window_size=8,
-        num_heads=4,
-        qk_norm=False,
-        event_encoder_type='2d',
-        attention_dim='2d',
-        temporal_window=2,
-        gated_3devent_base='tdc',
-        gated_3devent_gate='cbam3d',
-        gated_3devent_delta='dual_conv_residual',
-        gamma_init=0.0,
-        event_inject_gamma_init=1.0,
-        use_rgb_self_attn_h4=True,
-        use_event2d_self_attn_h4=True,
-        use_event3d_self_attn_h4=True,
-    ):
-        super().__init__()
-        self.late_fusion_mode = late_fusion_mode.lower()
-        self.event_encoder_type = event_encoder_type.lower()
-        self.attention_dim = attention_dim.lower()
-        self.gated_3devent_base = gated_3devent_base.lower()
-        self.gated_3devent_gate = gated_3devent_gate.lower()
-        self.gated_3devent_delta = gated_3devent_delta.lower()
-        if self.gated_3devent_delta != 'dual_conv_residual':
-            raise ValueError(f'Unknown gated_3devent_delta: {gated_3devent_delta}')
-        self.use_rgb_self_attn_h4 = use_rgb_self_attn_h4
-        self.use_event2d_self_attn_h4 = use_event2d_self_attn_h4
-        self.use_event3d_self_attn_h4 = use_event3d_self_attn_h4
-        dims = [base_dim, base_dim * 2, base_dim * 4]
-        h4_dim = dims[2]
-
-        self.image_encoder = ThreeScaleImageEncoder(rgb_in=rgb_in, base_dim=base_dim)
-        self.event_2d_encoder = EventEncoderWith3DOption(
-            event_in=event_in,
-            base_dim=base_dim,
-            encoder_type=event_encoder_type,
-        )
-        self.event_3d_encoder = EventVoxel3DEncoder(base_dim=base_dim)
-        self.event_tdc_encoder = EventTDC3DEncoder(base_dim=base_dim)
-        self.event_merge_h4 = ConvBlock2D(h4_dim * 2, h4_dim)
-        self.gated_event_merges = nn.ModuleList([ConvBlock2D(dim * 2, dim) for dim in dims])
-        self.rgb_self_attns = nn.ModuleList([ChannelSelfAttention2D(dim) for dim in dims])
-        self.event2d_self_attns = nn.ModuleList([ChannelSelfAttention2D(dim) for dim in dims])
-        self.event3d_self_attns = nn.ModuleList([ChannelSelfAttention3D(dim) for dim in dims])
-        self.tdc3d_self_attns = nn.ModuleList([ChannelSelfAttention3D(dim) for dim in dims])
-        self.gated_3devent_fusions = nn.ModuleList([
-            Gated3DEventFusion(
-                dim,
-                base=gated_3devent_base,
-                gate=gated_3devent_gate,
-                gamma_init=gamma_init,
-            )
-            for dim in dims
-        ])
-        self.gated_injects = nn.ModuleList([
-            nn.Sequential(
-                ConvBlock2D(dim, dim),
-                nn.Conv2d(dim, dim, kernel_size=3, padding=1),
-            )
-            for dim in dims
-        ])
-        self.attn = RGBQEventKVWindowAttention(
-            h4_dim,
-            window_size=window_size,
-            num_heads=num_heads,
-            qk_norm=qk_norm,
-        )
-        self.attn3d = RGBQEventKVWindowAttention3D(
-            h4_dim,
-            window_size=window_size,
-            temporal_window=temporal_window,
-            num_heads=num_heads,
-            qk_norm=qk_norm,
-        )
-        self.cat_fusion = nn.Sequential(
-            ConvBlock2D(h4_dim * 3, h4_dim),
-            nn.Conv2d(h4_dim, h4_dim, kernel_size=3, padding=1),
-        )
-        self.inject = nn.Sequential(
-            ConvBlock2D(h4_dim, h4_dim),
-            nn.Conv2d(h4_dim, h4_dim, kernel_size=3, padding=1),
-        )
-        self.norm_img_h4 = nn.GroupNorm(1, h4_dim)
-        self.norm_event2d_h4 = nn.GroupNorm(1, h4_dim)
-        self.norm_tdc_h4 = nn.GroupNorm(1, h4_dim)
-        self.norm_merged_h4 = nn.GroupNorm(1, h4_dim)
-        self.norm_fused_h4 = nn.GroupNorm(1, h4_dim)
-        self.ffn_h4 = ConvFFN2D(h4_dim)
-        self.gamma_attn = nn.Parameter(torch.ones(1) * 0.1)
-        self.gamma_ffn = nn.Parameter(torch.ones(1) * 0.1)
-        self.gamma_events = nn.Parameter(torch.ones(len(dims)) * event_inject_gamma_init)
-        self.up1 = UpBlock(dims[2], dims[1], dims[1])
-        self.up0 = UpBlock(dims[1], dims[0], dims[0])
-        self.reconstruct = nn.Sequential(
-            ConvBlock2D(dims[0], dims[0]),
-            nn.Conv2d(dims[0], rgb_in, kernel_size=3, padding=1),
-        )
-
-    @staticmethod
-    def _strip_plus_mode(late_fusion_mode):
-        if late_fusion_mode.endswith('_plus'):
-            return late_fusion_mode[:-5], True
-        if late_fusion_mode in ('a_plus', 'b_plus', 'c_plus'):
-            return late_fusion_mode[0], True
-        return late_fusion_mode, False
-
-    def fuse_h4(self, img_h4, event2d_h4, tdc_h4, event3d_h4=None, tdc3d_h4=None):
-        base_mode, use_plus = self._strip_plus_mode(self.late_fusion_mode)
-        if base_mode == 'gated_3devent':
-            if event3d_h4 is None or tdc3d_h4 is None:
-                raise ValueError('gated_3devent requires ordinary 3D event features and TDC3D features.')
-            if self.use_rgb_self_attn_h4:
-                img_h4 = self.rgb_self_attns[2](img_h4)
-            if self.use_event2d_self_attn_h4:
-                event2d_h4 = self.event2d_self_attns[2](event2d_h4)
-            if self.use_event3d_self_attn_h4:
-                event3d_h4 = self.event3d_self_attns[2](event3d_h4)
-                tdc3d_h4 = self.tdc3d_self_attns[2](tdc3d_h4)
-            fused3d_h4 = self.gated_3devent_fusions[2](event3d_h4, tdc3d_h4).mean(dim=2)
-            event_h4 = self.gated_event_merges[2](torch.cat([event2d_h4, fused3d_h4], dim=1))
-            return img_h4 + self.gamma_events[2] * self.gated_injects[2](event_h4)
-        if base_mode in ('cat', 'concat'):
-            fusion_delta = self.cat_fusion(torch.cat([img_h4, event2d_h4, tdc_h4], dim=1))
-            return img_h4 + fusion_delta
-        img_for_attn = self.norm_img_h4(img_h4) if use_plus else img_h4
-        event2d_for_attn = self.norm_event2d_h4(event2d_h4) if use_plus else event2d_h4
-        tdc_for_attn = self.norm_tdc_h4(tdc_h4) if use_plus else tdc_h4
-        event3d_for_attn = self.norm_event2d_h4(event3d_h4) if use_plus and event3d_h4 is not None else event3d_h4
-        tdc3d_for_attn = self.norm_tdc_h4(tdc3d_h4) if use_plus and tdc3d_h4 is not None else tdc3d_h4
-
-        if self.attention_dim == '3d':
-            if event3d_for_attn is None or tdc3d_for_attn is None:
-                raise ValueError('attention_dim=3d requires event_encoder_type=3d and 3D TDC features.')
-            if base_mode in ('kv_2d_k_tdc_v', 'a'):
-                attn_event = self.attn3d(img_for_attn, key_feat_3d=event3d_for_attn, value_feat_3d=tdc3d_for_attn)
-            elif base_mode in ('kv_2d_only', 'event2d_only', 'e2d'):
-                attn_event = self.attn3d(img_for_attn, key_feat_3d=event3d_for_attn, value_feat_3d=event3d_for_attn)
-            elif base_mode in ('kv_tdc_only', 'tdc_only'):
-                attn_event = self.attn3d(img_for_attn, key_feat_3d=tdc3d_for_attn, value_feat_3d=tdc3d_for_attn)
-            else:
-                raise ValueError(f'attention_dim=3d currently supports A/event2d_only/tdc_only, got: {self.late_fusion_mode}')
-        elif base_mode in ('kv_2d_only', 'event2d_only', 'e2d'):
-            attn_event = self.attn(img_for_attn, key_feat=event2d_for_attn, value_feat=event2d_for_attn)
-        elif base_mode in ('kv_tdc_only', 'tdc_only'):
-            attn_event = self.attn(img_for_attn, key_feat=tdc_for_attn, value_feat=tdc_for_attn)
-        elif base_mode in ('kv_2d_k_tdc_v', 'a'):
-            attn_event = self.attn(img_for_attn, key_feat=event2d_for_attn, value_feat=tdc_for_attn)
-        elif base_mode in ('kv_2d_v_tdc_k', 'b'):
-            attn_event = self.attn(img_for_attn, key_feat=tdc_for_attn, value_feat=event2d_for_attn)
-        elif base_mode in ('kv_merged', 'c'):
-            merged_event = self.event_merge_h4(torch.cat([event2d_h4, tdc_h4], dim=1))
-            if use_plus:
-                merged_event = self.norm_merged_h4(merged_event)
-            attn_event = self.attn(img_for_attn, key_feat=merged_event, value_feat=merged_event)
-        else:
-            raise ValueError(f'Unknown late_fusion_mode: {self.late_fusion_mode}')
-        if use_plus:
-            fused = img_h4 + self.gamma_attn * self.inject(attn_event)
-            return fused + self.gamma_ffn * self.ffn_h4(self.norm_fused_h4(fused))
-        return img_h4 + self.inject(attn_event)
-
-    def fuse_gated_multiscale(self, img_feats, event2d_feats, event3d_feats, tdc3d_feats):
-        fused_feats = []
-        for i, (img_feat, event2d_feat, event3d_feat, tdc3d_feat) in enumerate(
-            zip(img_feats, event2d_feats, event3d_feats, tdc3d_feats)
-        ):
-            if event3d_feat.shape[:2] != tdc3d_feat.shape[:2] or event3d_feat.shape[-3:] != tdc3d_feat.shape[-3:]:
-                raise ValueError(f'E/T scale {i} shape mismatch: {event3d_feat.shape} vs {tdc3d_feat.shape}')
-            if img_feat.shape[-2:] != event2d_feat.shape[-2:]:
-                raise ValueError(f'RGB/Event2D scale {i} shape mismatch: {img_feat.shape} vs {event2d_feat.shape}')
-            if img_feat.shape[-2:] != event3d_feat.shape[-2:]:
-                raise ValueError(f'RGB/Event3D scale {i} shape mismatch: {img_feat.shape} vs {event3d_feat.shape}')
-
-            if self.use_rgb_self_attn_h4:
-                img_feat = self.rgb_self_attns[i](img_feat)
-            if self.use_event2d_self_attn_h4:
-                event2d_feat = self.event2d_self_attns[i](event2d_feat)
-            if self.use_event3d_self_attn_h4:
-                event3d_feat = self.event3d_self_attns[i](event3d_feat)
-                tdc3d_feat = self.tdc3d_self_attns[i](tdc3d_feat)
-
-            fused3d = self.gated_3devent_fusions[i](event3d_feat, tdc3d_feat)
-            fused3d_2d = fused3d.mean(dim=2)
-            event_feat = self.gated_event_merges[i](torch.cat([event2d_feat, fused3d_2d], dim=1))
-            fused_feats.append(img_feat + self.gamma_events[i] * self.gated_injects[i](event_feat))
-        return fused_feats
-
-    def forward(self, blur, event):
-        img_feats = self.image_encoder(blur)
-        gated_3devent = self._strip_plus_mode(self.late_fusion_mode)[0] == 'gated_3devent'
-        need_3d = self.attention_dim == '3d'
-        if gated_3devent:
-            event2d_feats, _ = self.event_2d_encoder(event, return_3d=False)
-            _, event3d_feats = self.event_3d_encoder(event, return_3d=True)
-            tdc_feats, tdc3d_feats = self.event_tdc_encoder(event, return_3d=True)
-            fused_feats = self.fuse_gated_multiscale(img_feats, event2d_feats, event3d_feats, tdc3d_feats)
-            x = self.up1(fused_feats[2], fused_feats[1])
-            x = self.up0(x, fused_feats[0])
-            residual = self.reconstruct(x)
-            return residual + blur
-        else:
-            event2d_feats, event3d_feats = self.event_2d_encoder(event, return_3d=need_3d)
-            tdc_feats, tdc3d_feats = self.event_tdc_encoder(event, return_3d=need_3d)
-
-        event3d_h4 = event3d_feats[2] if event3d_feats is not None else None
-        tdc3d_h4 = tdc3d_feats[2] if tdc3d_feats is not None else None
-        fused_h4 = self.fuse_h4(img_feats[2], event2d_feats[2], tdc_feats[2], event3d_h4, tdc3d_h4)
-        x = self.up1(fused_h4, img_feats[1])
-        x = self.up0(x, img_feats[0])
-        residual = self.reconstruct(x)
-        return residual + blur
+def build_deblur_model(**model_cfg):
+    model_type = model_cfg.pop("model_type", model_cfg.pop("type", "progressive_fusion"))
+    if model_type != "progressive_fusion":
+        raise ValueError("Only model.type: progressive_fusion is supported by the three-branch network.")
+    return ThreeBranchProgressiveDeblurNet(**model_cfg)
 
 
-class NoEventDeblurNet(nn.Module):
-    def __init__(self, rgb_in=3, base_dim=32):
-        super().__init__()
-        self.encoder_rgb = nn.Sequential(
-            nn.Conv2d(rgb_in, base_dim, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(base_dim, base_dim, kernel_size=3, padding=1, stride=2),
-            nn.LeakyReLU(0.2, True),
-        )
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(base_dim, base_dim, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(base_dim, base_dim, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(base_dim, rgb_in, kernel_size=3, padding=1),
-        )
-
-    def forward(self, blur, event=None):
-        residual = self.decoder(self.encoder_rgb(blur))
-        return residual + blur
-
-
-class ConcatEventDeblurNet(nn.Module):
-    def __init__(self, rgb_in=3, event_in=6, base_dim=32):
-        super().__init__()
-        self.encoder_rgb = nn.Sequential(
-            nn.Conv2d(rgb_in, base_dim, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(base_dim, base_dim, kernel_size=3, padding=1, stride=2),
-            nn.LeakyReLU(0.2, True),
-        )
-        self.encoder_event = nn.Sequential(
-            TDCBlock3D(in_channels=1, out_channels=base_dim),
-            nn.Conv3d(base_dim, base_dim, kernel_size=(1, 3, 3), padding=(0, 1, 1), stride=(1, 2, 2)),
-            nn.LeakyReLU(0.2, True),
-        )
-        self.time_pool = nn.AdaptiveAvgPool3d((1, None, None))
-        self.fusion_conv = nn.Sequential(
-            nn.Conv2d(base_dim * 2, base_dim, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2, True),
-        )
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(base_dim, base_dim, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(base_dim, base_dim, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(base_dim, rgb_in, kernel_size=3, padding=1),
-        )
-
-    def forward(self, blur, event):
-        feat_rgb = self.encoder_rgb(blur)
-        feat_event = self.encoder_event(event.unsqueeze(1))
-        feat_event = self.time_pool(feat_event).squeeze(2)
-        fused = self.fusion_conv(torch.cat([feat_rgb, feat_event], dim=1))
-        residual = self.decoder(fused)
-        return residual + blur
-
-
-class TDC_Deblur_Net(nn.Module):
-    def __init__(self, rgb_in=3, event_in=6, base_dim=32):
-        super().__init__()
-        self.encoder_rgb = nn.Sequential(
-            nn.Conv2d(rgb_in, base_dim, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(base_dim, base_dim, kernel_size=3, padding=1, stride=2),
-        )
-        self.encoder_event = nn.Sequential(
-            TDCBlock3D(in_channels=1, out_channels=base_dim),
-            nn.Conv3d(base_dim, base_dim, kernel_size=(1, 3, 3), padding=(0, 1, 1), stride=(1, 2, 2)),
-            nn.LeakyReLU(0.2, True),
-        )
-        self.sta_fusion = CrossModalSTA(in_channels=base_dim)
-        self.time_pool = nn.AdaptiveAvgPool3d((1, None, None))
-        self.fusion_conv = nn.Conv2d(base_dim * 2, base_dim, kernel_size=3, padding=1)
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(base_dim, base_dim, kernel_size=4, stride=2, padding=1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(base_dim, base_dim, kernel_size=3, padding=1),
-            nn.LeakyReLU(0.2, True),
-            nn.Conv2d(base_dim, rgb_in, kernel_size=3, padding=1),
-        )
-
-    def forward(self, blur, event):
-        feat_rgb = self.encoder_rgb(blur)
-        feat_event = self.encoder_event(event.unsqueeze(1))
-        fused_event_3d = self.sta_fusion(feat_rgb, feat_event)
-        fused_event_2d = self.time_pool(fused_event_3d).squeeze(2)
-        bottleneck_feat = self.fusion_conv(torch.cat([feat_rgb, fused_event_2d], dim=1))
-        out = self.decoder(bottleneck_feat)
-        return out + blur
-
-
-def build_deblur_model(
-    model_type='attention',
-    rgb_in=3,
-    event_in=6,
-    base_dim=32,
-    fusion_type='hybrid',
-    fusion_family='gated',
-    qkv_mode='rgb_qk_event_v',
-    stage_fusion_mode=None,
-    stage_fusion_dim='3d',
-    internal_3d_ca_mode='tdc_query',
-    cascaded_ca_order='motion_then_struct',
-    event_fusion_dim='3d',
-    late_fusion_mode='kv_2d_k_tdc_v',
-    window_size=8,
-    num_heads=4,
-    qk_norm=False,
-    event_encoder_type='2d',
-    attention_dim='2d',
-    temporal_window=2,
-    gated_3devent_base='tdc',
-    gated_3devent_gate='cbam3d',
-    gated_3devent_delta='dual_conv_residual',
-    gamma_init=0.0,
-    event_inject_gamma_init=1.0,
-    use_rgb_self_attn_h4=True,
-    use_event2d_self_attn_h4=True,
-    use_event3d_self_attn_h4=True,
-):
-    model_type = model_type.lower()
-    if model_type in ('progressive_fusion', 'parallel_fusion', 'staged_tribranch', 'progressive_tribranch', 'tri_branch_staged'):
-        return StagedTriBranchDeblurNet(
-            rgb_in=rgb_in,
-            event_in=event_in,
-            base_dim=base_dim,
-            progressive_scales=model_type not in ('parallel_fusion',),
-            fusion_family=fusion_family,
-            stage_fusion_mode=stage_fusion_mode or qkv_mode,
-            stage_fusion_dim=stage_fusion_dim,
-            internal_3d_ca_mode=internal_3d_ca_mode,
-            cascaded_ca_order=cascaded_ca_order,
-            event_fusion_dim=event_fusion_dim,
-            window_size=window_size,
-            temporal_window=temporal_window,
-            num_heads=num_heads,
-            qk_norm=qk_norm,
-            gated_3devent_base=gated_3devent_base,
-            gated_3devent_gate=gated_3devent_gate,
-            gated_3devent_delta=gated_3devent_delta,
-            gamma_init=gamma_init,
-            event_inject_gamma_init=event_inject_gamma_init,
-            use_rgb_self_attn_h4=use_rgb_self_attn_h4,
-            use_event2d_self_attn_h4=use_event2d_self_attn_h4,
-            use_event3d_self_attn_h4=use_event3d_self_attn_h4,
-        )
-    if model_type in ('parallel_fusion', 'late_fusion', 'late_fusion_tdc', 'single_fusion'):
-        return LateFusionTDCEventDeblurNet(
-            rgb_in=rgb_in,
-            event_in=event_in,
-            base_dim=base_dim,
-            late_fusion_mode=late_fusion_mode,
-            window_size=window_size,
-            num_heads=num_heads,
-            qk_norm=qk_norm,
-            event_encoder_type=event_encoder_type,
-            attention_dim=attention_dim,
-            temporal_window=temporal_window,
-            gated_3devent_base=gated_3devent_base,
-            gated_3devent_gate=gated_3devent_gate,
-            gated_3devent_delta=gated_3devent_delta,
-            gamma_init=gamma_init,
-            event_inject_gamma_init=event_inject_gamma_init,
-            use_rgb_self_attn_h4=use_rgb_self_attn_h4,
-            use_event2d_self_attn_h4=use_event2d_self_attn_h4,
-            use_event3d_self_attn_h4=use_event3d_self_attn_h4,
-        )
-    if model_type in ('multiscale', 'multiscale_tdc', 'tdc_multiscale'):
-        return MultiScaleTDCEventDeblurNet(
-            rgb_in=rgb_in,
-            event_in=event_in,
-            base_dim=base_dim,
-            fusion_type=fusion_type,
-            qkv_mode=qkv_mode,
-            window_size=window_size,
-            num_heads=num_heads,
-        )
-    if model_type in ('attention', 'tdc_attention', 'sta'):
-        return TDC_Deblur_Net(rgb_in=rgb_in, event_in=event_in, base_dim=base_dim)
-    if model_type in ('concat', 'event_concat'):
-        return ConcatEventDeblurNet(rgb_in=rgb_in, event_in=event_in, base_dim=base_dim)
-    if model_type in ('no_event', 'image_only', 'blur_only'):
-        return NoEventDeblurNet(rgb_in=rgb_in, base_dim=base_dim)
-    raise ValueError(f'Unknown model type: {model_type}')
-
-
-if __name__ == '__main__':
-    dummy_blur = torch.randn(2, 3, 128, 128)
-    dummy_event = torch.randn(2, 6, 128, 128)
-    model = build_deblur_model(model_type='multiscale', base_dim=24)
-    out = model(dummy_blur, dummy_event)
-    print('Input blur:', dummy_blur.shape)
-    print('Input event:', dummy_event.shape)
-    print('Output:', out.shape)
-    print('Params:', sum(p.numel() for p in model.parameters() if p.requires_grad))
+if __name__ == "__main__":
+    model = build_deblur_model(base_dim=16)
+    blur = torch.randn(1, 3, 64, 64)
+    event = torch.randn(1, 6, 64, 64)
+    print(model(blur, event).shape)
