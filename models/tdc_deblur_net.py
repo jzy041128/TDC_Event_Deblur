@@ -282,17 +282,27 @@ class ThreeBranchStageFusion(nn.Module):
                     nn.Conv3d(channels, channels, 1),
                 )
         elif self.fusion_dim == "2d":
-            self.ca = WindowCrossAttention2D(channels, cross_window_size, num_heads, qk_norm)
             self.inject1 = nn.Conv2d(channels, channels, 3, padding=1)
             if self.fusion_mode == "cascaded_ca":
+                self.ca1 = WindowCrossAttention2D(channels, cross_window_size, num_heads, qk_norm)
+                self.ca2 = WindowCrossAttention2D(channels, cross_window_size, num_heads, qk_norm)
                 self.inject2 = nn.Conv2d(channels, channels, 3, padding=1)
+            else:
+                self.ca = WindowCrossAttention2D(channels, cross_window_size, num_heads, qk_norm)
         else:
-            self.ca = WindowCrossAttention3D(
-                channels, cross_window_size, temporal_window_size, num_heads, qk_norm
-            )
             self.inject1 = nn.Conv3d(channels, channels, 3, padding=1)
             if self.fusion_mode == "cascaded_ca":
+                self.ca1 = WindowCrossAttention3D(
+                    channels, cross_window_size, temporal_window_size, num_heads, qk_norm
+                )
+                self.ca2 = WindowCrossAttention3D(
+                    channels, cross_window_size, temporal_window_size, num_heads, qk_norm
+                )
                 self.inject2 = nn.Conv3d(channels, channels, 3, padding=1)
+            else:
+                self.ca = WindowCrossAttention3D(
+                    channels, cross_window_size, temporal_window_size, num_heads, qk_norm
+                )
 
         self.gamma1 = nn.Parameter(torch.ones(1) * gamma_init)
         if self.fusion_mode == "cascaded_ca":
@@ -316,13 +326,13 @@ class ThreeBranchStageFusion(nn.Module):
     def cascade_2d(self, rgb, event2d, event3d):
         event3d = event3d.mean(dim=2)
         if self.cascaded_ca_order == "motion_then_struct":
-            x = rgb + self.gamma1 * self.inject1(self.ca(rgb, event3d, event3d))
-            return x + self.gamma2 * self.inject2(self.ca(x, event2d, event2d))
+            x = rgb + self.gamma1 * self.inject1(self.ca1(rgb, event3d, event3d))
+            return x + self.gamma2 * self.inject2(self.ca2(x, event2d, event2d))
         if self.cascaded_ca_order == "struct_then_motion":
-            x = rgb + self.gamma1 * self.inject1(self.ca(rgb, event2d, event2d))
-            return x + self.gamma2 * self.inject2(self.ca(x, event3d, event3d))
-        event = event3d + self.gamma1 * self.inject1(self.ca(event3d, event2d, event2d))
-        return rgb + self.gamma2 * self.inject2(self.ca(rgb, event, event))
+            x = rgb + self.gamma1 * self.inject1(self.ca1(rgb, event2d, event2d))
+            return x + self.gamma2 * self.inject2(self.ca2(x, event3d, event3d))
+        event = event3d + self.gamma1 * self.inject1(self.ca1(event3d, event2d, event2d))
+        return rgb + self.gamma2 * self.inject2(self.ca2(rgb, event, event))
 
     def single_3d(self, rgb, event2d, event3d):
         time_steps = event3d.shape[2]
@@ -339,14 +349,14 @@ class ThreeBranchStageFusion(nn.Module):
         rgb = self.expand_time(rgb, time_steps)
         event2d = self.expand_time(event2d, time_steps)
         if self.cascaded_ca_order == "motion_then_struct":
-            x = rgb + self.gamma1 * self.inject1(self.ca(rgb, event3d, event3d))
-            x = x + self.gamma2 * self.inject2(self.ca(x, event2d, event2d))
+            x = rgb + self.gamma1 * self.inject1(self.ca1(rgb, event3d, event3d))
+            x = x + self.gamma2 * self.inject2(self.ca2(x, event2d, event2d))
         elif self.cascaded_ca_order == "struct_then_motion":
-            x = rgb + self.gamma1 * self.inject1(self.ca(rgb, event2d, event2d))
-            x = x + self.gamma2 * self.inject2(self.ca(x, event3d, event3d))
+            x = rgb + self.gamma1 * self.inject1(self.ca1(rgb, event2d, event2d))
+            x = x + self.gamma2 * self.inject2(self.ca2(x, event3d, event3d))
         else:
-            event = event3d + self.gamma1 * self.inject1(self.ca(event3d, event2d, event2d))
-            x = rgb + self.gamma2 * self.inject2(self.ca(rgb, event, event))
+            event = event3d + self.gamma1 * self.inject1(self.ca1(event3d, event2d, event2d))
+            x = rgb + self.gamma2 * self.inject2(self.ca2(rgb, event, event))
         return x.mean(dim=2)
 
     def forward(self, rgb, event2d, event3d):
