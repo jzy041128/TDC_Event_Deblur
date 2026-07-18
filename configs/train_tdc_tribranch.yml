@@ -1,11 +1,12 @@
-name: ThreeBranch_Cat_2D_Server_60ep
+name: ThreeBranch_ChannelCA_2D_Server_60ep
 
 model:
   type: progressive_fusion
   base_dim: 32
 
-  # cat / single_ca / cascaded_ca
-  fusion_mode: cat
+  # cat / single_ca / cascaded_ca / channel_ca
+  # channel_ca: Conv(Event2D, mean(Event3D)) -> shared Event K/V -> global channel attention.
+  fusion_mode: channel_ca
   # 2d: mean Event3D before fusion; 3d: preserve time until fusion finishes.
   fusion_dim: 2d
 
@@ -26,6 +27,7 @@ model:
   # Used by Event3D self-attention and all 3D fusion modes.
   temporal_window_size: 2
   num_heads: 4
+  # Used by window self/cross attention; channel_ca always normalizes Q and K spatial vectors.
   qk_norm: false
   gamma_init: 0.1
 
