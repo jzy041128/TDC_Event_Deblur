@@ -1,4 +1,4 @@
-name: ThreeBranch_EventConvOnly_2D_Server_60ep
+name: Seed42_CascadedChannelCA_MotionThenStruct_2D_Plain_Server_60ep
 
 model:
   type: progressive_fusion
@@ -11,9 +11,11 @@ model:
   # plain_channel_ca    = EventConv + standard scaled channel cross-attention.
   # channel_ca          = EventConv + normalized channel CA + learnable temperature.
   # event_add_channel_ca = Event2D + mean(Event3D), then normalized channel CA.
-  fusion_mode: event_conv
+  fusion_mode: cascaded_ca
   # 2d: mean Event3D before fusion; 3d: preserve time until fusion finishes.
   fusion_dim: 2d
+  # Used by single_ca/cascaded_ca: local spatial windows or global channel attention.
+  cross_attn_type: channel        # window / channel
 
   # Used by single_ca:
   # event2d_k_event3d_v = Q:RGB, K:Event2D, V:Event3D

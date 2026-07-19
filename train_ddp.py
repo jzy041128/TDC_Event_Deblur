@@ -247,6 +247,7 @@ def main():
         f"Model: three_branch_progressive | base_dim: {model_cfg.get('base_dim', 32)} | "
         f"fusion_mode: {model_cfg.get('fusion_mode', 'single_ca')} | "
         f"fusion_dim: {model_cfg.get('fusion_dim', '2d')} | "
+        f"cross_attn_type: {model_cfg.get('cross_attn_type', 'window')} | "
         f"single_ca_order: {model_cfg.get('single_ca_order', 'event2d_k_event3d_v')} | "
         f"cascaded_ca_order: {model_cfg.get('cascaded_ca_order', 'motion_then_struct')} | "
         f"windows(self/cross/time): {model_cfg.get('self_attn_window_size', 8)}/"

@@ -300,16 +300,16 @@ class EventImageChannelCrossAttention2D(nn.Module):
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
         self.proj = nn.Conv2d(channels, channels, 1, bias=False)
 
-    def forward(self, image, event):
-        if image.shape != event.shape:
-            raise ValueError("image and fused event features must have the same shape")
-        b, c, h, w = image.shape
+    def forward(self, query, key, value=None):
+        value = key if value is None else value
+        if query.shape != key.shape or query.shape != value.shape:
+            raise ValueError("query, key, and value must have the same shape")
+        b, c, h, w = query.shape
         head_dim = c // self.num_heads
 
-        q = self.q(self.norm_q(image)).view(b, self.num_heads, head_dim, h * w)
-        event = self.norm_kv(event)
-        k = self.k(event).view(b, self.num_heads, head_dim, h * w)
-        v = self.v(event).view(b, self.num_heads, head_dim, h * w)
+        q = self.q(self.norm_q(query)).view(b, self.num_heads, head_dim, h * w)
+        k = self.k(self.norm_kv(key)).view(b, self.num_heads, head_dim, h * w)
+        v = self.v(self.norm_kv(value)).view(b, self.num_heads, head_dim, h * w)
 
         q = F.normalize(q, dim=-1)
         k = F.normalize(k, dim=-1)
@@ -420,6 +420,7 @@ class ThreeBranchStageFusion(nn.Module):
         channels,
         fusion_mode,
         fusion_dim,
+        cross_attn_type,
         single_ca_order,
         cascaded_ca_order,
         cross_window_size,
@@ -431,6 +432,7 @@ class ThreeBranchStageFusion(nn.Module):
         super().__init__()
         self.fusion_mode = fusion_mode.lower()
         self.fusion_dim = fusion_dim.lower()
+        self.cross_attn_type = cross_attn_type.lower()
         self.single_ca_order = single_ca_order.lower()
         self.cascaded_ca_order = cascaded_ca_order.lower()
         valid_modes = {"cat", "single_ca", "cascaded_ca"} | self.TWO_DIM_ONLY_MODES
@@ -438,6 +440,14 @@ class ThreeBranchStageFusion(nn.Module):
             raise ValueError(f"Unknown fusion_mode: {fusion_mode}")
         if self.fusion_dim not in {"2d", "3d"}:
             raise ValueError(f"Unknown fusion_dim: {fusion_dim}")
+        if self.cross_attn_type not in {"window", "channel"}:
+            raise ValueError(f"Unknown cross_attn_type: {cross_attn_type}")
+        if (
+            self.fusion_mode in {"single_ca", "cascaded_ca"}
+            and self.cross_attn_type == "channel"
+            and self.fusion_dim != "2d"
+        ):
+            raise ValueError("cross_attn_type: channel requires fusion_dim: 2d")
         if self.fusion_mode in self.TWO_DIM_ONLY_MODES and self.fusion_dim != "2d":
             raise ValueError(f"fusion_mode: {self.fusion_mode} requires fusion_dim: 2d")
         if self.single_ca_order not in self.SINGLE_ORDERS:
@@ -470,12 +480,18 @@ class ThreeBranchStageFusion(nn.Module):
             self.channel_ca = EventImageChannelCrossAttention2D(channels, num_heads)
         elif self.fusion_dim == "2d":
             self.inject1 = nn.Conv2d(channels, channels, 3, padding=1)
+            if self.cross_attn_type == "channel":
+                make_ca = lambda: EventImageChannelCrossAttention2D(channels, num_heads)
+            else:
+                make_ca = lambda: WindowCrossAttention2D(
+                    channels, cross_window_size, num_heads, qk_norm
+                )
             if self.fusion_mode == "cascaded_ca":
-                self.ca1 = WindowCrossAttention2D(channels, cross_window_size, num_heads, qk_norm)
-                self.ca2 = WindowCrossAttention2D(channels, cross_window_size, num_heads, qk_norm)
+                self.ca1 = make_ca()
+                self.ca2 = make_ca()
                 self.inject2 = nn.Conv2d(channels, channels, 3, padding=1)
             else:
-                self.ca = WindowCrossAttention2D(channels, cross_window_size, num_heads, qk_norm)
+                self.ca = make_ca()
         else:
             self.inject1 = nn.Conv3d(channels, channels, 3, padding=1)
             if self.fusion_mode == "cascaded_ca":
@@ -586,6 +602,7 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         base_dim=32,
         fusion_mode="single_ca",
         fusion_dim="2d",
+        cross_attn_type="window",
         single_ca_order="event2d_k_event3d_v",
         cascaded_ca_order="motion_then_struct",
         self_attn_window_size=8,
@@ -638,6 +655,7 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
                 dim,
                 fusion_mode,
                 fusion_dim,
+                cross_attn_type,
                 single_ca_order,
                 cascaded_ca_order,
                 cross_attn_window_size,
