@@ -18,6 +18,13 @@ from skimage.metrics import structural_similarity as calculate_ssim
 from data.dataset import build_dataset
 from models.losses import build_loss
 from models.tdc_deblur_net import build_deblur_model
+from utils.reproducibility import (
+    EpochRandomSampler,
+    capture_rng_state,
+    restore_rng_state,
+    seed_worker,
+    set_global_seed,
+)
 
 class Logger(object):
     """
@@ -88,6 +95,10 @@ def main():
     args = parse_args()
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
+    train_cfg = config.get('train', {})
+    seed = int(train_cfg.get('seed', 42))
+    deterministic = bool(train_cfg.get('deterministic', True))
+    set_global_seed(seed, deterministic)
 
     # 2. 建立实验文件夹；恢复训练时继续使用 checkpoint 所在目录
     resume_path = config['path'].get('resume_state')
@@ -107,21 +118,24 @@ def main():
 
     # 3. 设置设备 (2060 GPU 全开)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if device.type == 'cuda':
-        torch.backends.cudnn.benchmark = True
+    print(f"Seed: {seed} | deterministic: {deterministic}")
     print(f"💻 正在使用设备: {device}")
 
     # 4. 加载数据 (Train 和 Val)
     train_opt = dict(config['datasets']['train'])
+    train_opt['seed'] = seed
     train_opt['split'] = '训练集'
     train_dataset = build_dataset(train_opt)
+    train_sampler = EpochRandomSampler(train_dataset, seed)
     train_num_workers = config['datasets']['train'].get('num_workers', 4)
     train_loader_kwargs = {
         'batch_size': config['datasets']['train']['batch_size'],
-        'shuffle': True,
+        'sampler': train_sampler,
         'num_workers': train_num_workers,
-        'persistent_workers': train_num_workers > 0,
+        'persistent_workers': train_num_workers > 0 and not deterministic,
         'pin_memory': True,
+        'worker_init_fn': seed_worker,
+        'generator': torch.Generator().manual_seed(seed),
     }
     if train_num_workers > 0:
         train_loader_kwargs['prefetch_factor'] = config['datasets']['train'].get('prefetch_factor', 4)
@@ -148,7 +162,10 @@ def main():
         f"cascaded_ca_order: {model_cfg.get('cascaded_ca_order', 'motion_then_struct')} | "
         f"windows(self/cross/time): {model_cfg.get('self_attn_window_size', 8)}/"
         f"{model_cfg.get('cross_attn_window_size', 8)}/{model_cfg.get('temporal_window_size', 2)} | "
-        f"num_heads: {model_cfg.get('num_heads', 4)}"
+        f"num_heads: {model_cfg.get('num_heads', 4)} | "
+        f"decoder: {model_cfg.get('decoder_block', 'plain')} | "
+        f"two_stage: {model_cfg.get('two_stage', False)} | "
+        f"sam: {model_cfg.get('sam_mode', 'none')} | refine: {model_cfg.get('refine_type', 'shallow')}"
     )
     loss_cfg = config.get('loss', {})
     criterion = build_loss(
@@ -173,6 +190,7 @@ def main():
                 print(f"   Reason: {err}")
             start_epoch = checkpoint['epoch']
             best_psnr = checkpoint.get('best_psnr', 0.0)
+            restore_rng_state(checkpoint.get('rng_state'))
             log_best_psnr = parse_best_psnr_from_log(os.path.join(exp_dir, "train_log.txt"))
             if log_best_psnr > best_psnr:
                 print(f"ℹ️ 从训练日志恢复更高历史最佳 PSNR: {log_best_psnr:.2f} dB")
@@ -186,6 +204,9 @@ def main():
     train_start_time = time.time()
     
     for epoch in range(start_epoch, num_epochs):
+        train_sampler.set_epoch(epoch)
+        if hasattr(train_dataset, 'set_epoch'):
+            train_dataset.set_epoch(epoch)
         epoch_start_time = time.time()
         model.train()
         epoch_loss = torch.zeros((), device=device)
@@ -197,8 +218,16 @@ def main():
             gt = batch_data['gt'].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            pred = model(blur, event)
-            loss = criterion(pred, gt)
+            output = model(blur, event, return_intermediate=True)
+            if isinstance(output, tuple):
+                pred, stage1_pred = output
+                loss = (
+                    train_cfg.get('stage2_loss_weight', 1.0) * criterion(pred, gt)
+                    + train_cfg.get('stage1_loss_weight', 0.5) * criterion(stage1_pred, gt)
+                )
+            else:
+                pred = output
+                loss = criterion(pred, gt)
             loss.backward()
             optimizer.step()
 
@@ -258,7 +287,9 @@ def main():
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'best_psnr': best_psnr
+            'best_psnr': best_psnr,
+            'rng_state': capture_rng_state(),
+            'seed': seed,
         }
         
         # 1. 每跑完一个 Epoch，覆盖保存一次 latest.pth (防停电)

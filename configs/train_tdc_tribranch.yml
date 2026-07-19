@@ -36,6 +36,13 @@ model:
   qk_norm: false
   gamma_init: 0.1
 
+  # Decoder ablation: plain keeps the previous decoder; residual adds a local shortcut in each UpBlock.
+  decoder_block: plain            # plain / residual
+  # Stage-2 ablation. Keep sam_mode=none when two_stage=false.
+  two_stage: false                # false / true
+  sam_mode: none                  # none / standard / event_guided
+  refine_type: shallow            # shallow / light_unet
+
 loss:
   type: l1
   edge_weight: 0.05
@@ -82,6 +89,12 @@ datasets:
 train:
   num_epochs: 60
   learning_rate: 0.0002
+  # Use the same seed and deterministic mode for fair ablations.
+  seed: 42
+  deterministic: true
+  # Used only when two_stage=true: L = w2*L(final,GT) + w1*L(stage1,GT).
+  stage1_loss_weight: 0.5
+  stage2_loss_weight: 1.0
 
 path:
   # 2060: ./experiments

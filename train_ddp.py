@@ -19,6 +19,7 @@ from torch.utils.data.distributed import DistributedSampler
 from data.dataset import build_dataset
 from models.losses import build_loss
 from models.tdc_deblur_net import build_deblur_model
+from utils.reproducibility import capture_rng_state, restore_rng_state, seed_worker, set_global_seed
 
 
 class Logger(object):
@@ -130,9 +131,10 @@ def make_experiment_dir(config, resume_path):
     return exp_dir, resume_mode
 
 
-def build_loaders(config, rank, world_size):
+def build_loaders(config, rank, world_size, seed, deterministic):
     train_opt = dict(config["datasets"]["train"])
     train_opt["split"] = "train"
+    train_opt["seed"] = seed
     train_dataset = build_dataset(train_opt)
     train_sampler = DistributedSampler(
         train_dataset,
@@ -140,14 +142,17 @@ def build_loaders(config, rank, world_size):
         rank=rank,
         shuffle=True,
         drop_last=False,
+        seed=seed,
     )
     train_num_workers = train_opt.get("num_workers", 4)
     train_loader_kwargs = {
         "batch_size": train_opt["batch_size"],
         "sampler": train_sampler,
         "num_workers": train_num_workers,
-        "persistent_workers": train_num_workers > 0,
+        "persistent_workers": train_num_workers > 0 and not deterministic,
         "pin_memory": True,
+        "worker_init_fn": seed_worker,
+        "generator": torch.Generator().manual_seed(seed + rank),
     }
     if train_num_workers > 0:
         train_loader_kwargs["prefetch_factor"] = train_opt.get("prefetch_factor", 2)
@@ -214,9 +219,15 @@ def main():
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    train_cfg = config.get("train", {})
+    seed = int(train_cfg.get("seed", 42))
+    deterministic = bool(train_cfg.get("deterministic", True))
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
     local_rank, rank, world_size = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
-    torch.backends.cudnn.benchmark = True
+    set_global_seed(seed + rank, deterministic)
 
     resume_path = config["path"].get("resume_state")
     exp_dir, resume_mode = make_experiment_dir(config, resume_path)
@@ -227,8 +238,9 @@ def main():
         sys.stdout = NullWriter()
     print(f"Experiment dir: {exp_dir}")
     print(f"Device: {device} | DDP world_size: {world_size} | per_gpu_batch: {config['datasets']['train']['batch_size']}")
+    print(f"Seed: {seed} | deterministic: {deterministic}")
 
-    train_loader, train_sampler, val_loader = build_loaders(config, rank, world_size)
+    train_loader, train_sampler, val_loader = build_loaders(config, rank, world_size, seed, deterministic)
     model = build_model(config, device)
     model_cfg = config.get("model", {})
     print(
@@ -239,7 +251,10 @@ def main():
         f"cascaded_ca_order: {model_cfg.get('cascaded_ca_order', 'motion_then_struct')} | "
         f"windows(self/cross/time): {model_cfg.get('self_attn_window_size', 8)}/"
         f"{model_cfg.get('cross_attn_window_size', 8)}/{model_cfg.get('temporal_window_size', 2)} | "
-        f"num_heads: {model_cfg.get('num_heads', 4)}"
+        f"num_heads: {model_cfg.get('num_heads', 4)} | "
+        f"decoder: {model_cfg.get('decoder_block', 'plain')} | "
+        f"two_stage: {model_cfg.get('two_stage', False)} | "
+        f"sam: {model_cfg.get('sam_mode', 'none')} | refine: {model_cfg.get('refine_type', 'shallow')}"
     )
 
     loss_cfg = config.get("loss", {})
@@ -261,6 +276,9 @@ def main():
                 print("Optimizer state mismatch; optimizer is reinitialized.")
             start_epoch = checkpoint["epoch"]
             best_psnr = max(checkpoint.get("best_psnr", 0.0), parse_best_psnr_from_log(os.path.join(exp_dir, "train_log.txt")))
+            rng_states = checkpoint.get("rng_states")
+            if rng_states and rank < len(rng_states):
+                restore_rng_state(rng_states[rank])
             print(f"Resume from epoch {start_epoch}, best_psnr={best_psnr:.2f}")
         else:
             print(f"Resume path not found: {resume_path}. Start from scratch.")
@@ -269,6 +287,8 @@ def main():
     train_start_time = time.time()
     for epoch in range(start_epoch, num_epochs):
         train_sampler.set_epoch(epoch)
+        if hasattr(train_loader.dataset, "set_epoch"):
+            train_loader.dataset.set_epoch(epoch)
         epoch_start_time = time.time()
         model.train()
         epoch_loss = torch.zeros((), device=device)
@@ -281,8 +301,16 @@ def main():
             gt = batch_data["gt"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            pred = model(blur, event)
-            loss = criterion(pred, gt)
+            output = model(blur, event, return_intermediate=True)
+            if isinstance(output, tuple):
+                pred, stage1_pred = output
+                loss = (
+                    train_cfg.get("stage2_loss_weight", 1.0) * criterion(pred, gt)
+                    + train_cfg.get("stage1_loss_weight", 0.5) * criterion(stage1_pred, gt)
+                )
+            else:
+                pred = output
+                loss = criterion(pred, gt)
             loss.backward()
             optimizer.step()
 
@@ -308,6 +336,8 @@ def main():
                 psnr_gain = avg_psnr - avg_blur_psnr
                 print(f"Val -> Blur PSNR: {avg_blur_psnr:.2f} dB | Pred PSNR: {avg_psnr:.2f} dB | Gain: {psnr_gain:+.2f} dB | SSIM: {avg_ssim:.4f}\n")
 
+        rng_states = [None] * world_size
+        dist.all_gather_object(rng_states, capture_rng_state())
         if rank0():
             elapsed_total = time.time() - train_start_time
             elapsed_epoch = time.time() - epoch_start_time
@@ -329,6 +359,8 @@ def main():
                 "model_state_dict": unwrap_model(model).state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "best_psnr": best_psnr,
+                "rng_states": rng_states,
+                "seed": seed,
             }
             torch.save(save_dict, os.path.join(exp_dir, "latest.pth"))
             if is_best:

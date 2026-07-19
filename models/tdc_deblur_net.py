@@ -38,6 +38,68 @@ class UpBlock(nn.Module):
         return self.refine(torch.cat([x, skip], dim=1))
 
 
+class ResidualUpBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+        merged_channels = out_channels + skip_channels
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, 4, stride=2, padding=1)
+        self.main = ConvBlock2D(merged_channels, out_channels)
+        self.shortcut = nn.Conv2d(merged_channels, out_channels, 1)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+        merged = torch.cat([x, skip], dim=1)
+        return self.shortcut(merged) + self.main(merged)
+
+
+class SupervisedAttentionModule(nn.Module):
+    def __init__(self, channels, image_channels=3, event_channels=0):
+        super().__init__()
+        self.feature = nn.Conv2d(channels, channels, 3, padding=1)
+        self.attention = nn.Sequential(
+            nn.Conv2d(image_channels + event_channels, channels, 3, padding=1),
+            nn.Sigmoid(),
+        )
+        self.project = nn.Conv2d(channels, channels, 3, padding=1)
+
+    def forward(self, feature, stage1_image, event_guide=None):
+        attention_input = stage1_image
+        if event_guide is not None:
+            attention_input = torch.cat([stage1_image, event_guide], dim=1)
+        attended = self.feature(feature) * self.attention(attention_input)
+        return feature + self.project(attended)
+
+
+class ShallowRefineNet(nn.Module):
+    def __init__(self, channels, image_channels=3):
+        super().__init__()
+        self.body = nn.Sequential(
+            ConvBlock2D(channels + image_channels * 2, channels),
+            ConvBlock2D(channels, channels),
+            nn.Conv2d(channels, image_channels, 3, padding=1),
+        )
+
+    def forward(self, feature, stage1_image, blur):
+        return stage1_image + self.body(torch.cat([feature, stage1_image, blur], dim=1))
+
+
+class LightUNetRefineNet(nn.Module):
+    def __init__(self, channels, image_channels=3):
+        super().__init__()
+        self.stem = ConvBlock2D(channels + image_channels * 2, channels)
+        self.down = ConvBlock2D(channels, channels * 2, stride=2)
+        self.bottleneck = ConvBlock2D(channels * 2, channels * 2)
+        self.up = ResidualUpBlock(channels * 2, channels, channels)
+        self.to_image = nn.Conv2d(channels, image_channels, 3, padding=1)
+
+    def forward(self, feature, stage1_image, blur):
+        x0 = self.stem(torch.cat([feature, stage1_image, blur], dim=1))
+        x1 = self.bottleneck(self.down(x0))
+        return stage1_image + self.to_image(self.up(x1, x0))
+
+
 class ChannelLayerNorm2D(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -532,9 +594,27 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         num_heads=4,
         qk_norm=False,
         gamma_init=0.1,
+        decoder_block="plain",
+        two_stage=False,
+        sam_mode="none",
+        refine_type="shallow",
     ):
         super().__init__()
+        decoder_block = decoder_block.lower()
+        sam_mode = sam_mode.lower()
+        refine_type = refine_type.lower()
+        if decoder_block not in {"plain", "residual"}:
+            raise ValueError(f"Unknown decoder_block: {decoder_block}")
+        if sam_mode not in {"none", "standard", "event_guided"}:
+            raise ValueError(f"Unknown sam_mode: {sam_mode}")
+        if refine_type not in {"shallow", "light_unet"}:
+            raise ValueError(f"Unknown refine_type: {refine_type}")
+        if not two_stage and sam_mode != "none":
+            raise ValueError("sam_mode requires two_stage: true")
+
         dims = [base_dim, base_dim * 2, base_dim * 4]
+        self.two_stage = two_stage
+        self.sam_mode = sam_mode
         self.rgb_stem = ConvBlock2D(rgb_in, dims[0])
         self.event2d_stem = ConvBlock2D(event_in, dims[0])
         self.event3d_stem = ShortTermTDCBlock3D(1, dims[0])
@@ -568,9 +648,18 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
             )
             for dim in dims
         ])
-        self.up1 = UpBlock(dims[2], dims[1], dims[1])
-        self.up0 = UpBlock(dims[1], dims[0], dims[0])
+        up_block = UpBlock if decoder_block == "plain" else ResidualUpBlock
+        self.up1 = up_block(dims[2], dims[1], dims[1])
+        self.up0 = up_block(dims[1], dims[0], dims[0])
         self.reconstruct = nn.Sequential(ConvBlock2D(dims[0], dims[0]), nn.Conv2d(dims[0], rgb_in, 3, padding=1))
+        if self.two_stage:
+            if self.sam_mode == "standard":
+                self.sam = SupervisedAttentionModule(dims[0], rgb_in)
+            elif self.sam_mode == "event_guided":
+                self.event_guide = ConvBlock2D(dims[0] * 2, dims[0])
+                self.sam = SupervisedAttentionModule(dims[0], rgb_in, dims[0])
+            refine_net = ShallowRefineNet if refine_type == "shallow" else LightUNetRefineNet
+            self.refine = refine_net(dims[0], rgb_in)
 
     def attend(self, scale, rgb, event2d, event3d):
         return (
@@ -579,11 +668,12 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
             self.event3d_self_attn[scale](event3d),
         )
 
-    def forward(self, blur, event):
+    def forward(self, blur, event, return_intermediate=False):
         rgb = self.rgb_stem(blur)
         event2d = self.event2d_stem(event)
         event3d = self.event3d_stem(event.unsqueeze(1))
         rgb, event2d, event3d = self.attend(0, rgb, event2d, event3d)
+        event2d_h, event3d_h = event2d, event3d
         fused0 = self.fusions[0](rgb, event2d, event3d)
 
         rgb = self.rgb_down[0](fused0)
@@ -600,7 +690,20 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
 
         x = self.up1(fused2, fused1)
         x = self.up0(x, fused0)
-        return blur + self.reconstruct(x)
+        stage1_image = blur + self.reconstruct(x)
+        if not self.two_stage:
+            return stage1_image
+
+        refine_feature = x
+        if self.sam_mode == "standard":
+            refine_feature = self.sam(x, stage1_image)
+        elif self.sam_mode == "event_guided":
+            event_guide = self.event_guide(torch.cat([event2d_h, event3d_h.mean(dim=2)], dim=1))
+            refine_feature = self.sam(x, stage1_image, event_guide)
+        final_image = self.refine(refine_feature, stage1_image, blur)
+        if return_intermediate:
+            return final_image, stage1_image
+        return final_image
 
 
 def build_deblur_model(**model_cfg):

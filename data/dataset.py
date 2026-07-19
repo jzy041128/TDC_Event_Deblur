@@ -61,15 +61,16 @@ def _load_event(path, height, width, num_bins):
     return torch.from_numpy(np.ascontiguousarray(event)).float()
 
 
-def _crop_triplet(blur, gt, event, patch_size, random_crop=True):
+def _crop_triplet(blur, gt, event, patch_size, random_crop=True, rng=None):
     _, h, w = gt.shape
     th, tw = patch_size, patch_size
     if h <= th or w <= tw:
         return blur, gt, event
 
     if random_crop:
-        i = random.randint(0, h - th)
-        j = random.randint(0, w - tw)
+        rng = rng or random
+        i = rng.randint(0, h - th)
+        j = rng.randint(0, w - tw)
     else:
         i = (h - th) // 2
         j = (w - tw) // 2
@@ -94,6 +95,8 @@ class H5EventDeblurDataset(Dataset):
         self.split = opt_dataset.get("split", "dataset")
         self.max_open_h5 = opt_dataset.get("max_open_h5", 2)
         self.norm_event = opt_dataset.get("norm_event", False)
+        self.seed = opt_dataset.get("seed")
+        self.epoch = 0
         self.h5_cache = OrderedDict()
 
         self.h5_files = sorted(glob.glob(os.path.join(self.dataroot, "*.h5")))
@@ -114,6 +117,14 @@ class H5EventDeblurDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def _sample_rng(self, index):
+        if self.seed is None:
+            return None
+        return random.Random(self.seed + self.epoch * len(self.samples) + index)
 
     def _get_h5_file(self, h5_path):
         if self.max_open_h5 <= 0:
@@ -157,7 +168,7 @@ class H5EventDeblurDataset(Dataset):
             event_tensor = _normalize_event(event_tensor)
 
         img_blur, img_gt, event_tensor = _crop_triplet(
-            img_blur, img_gt, event_tensor, self.patch_size, self.random_crop
+            img_blur, img_gt, event_tensor, self.patch_size, self.random_crop, self._sample_rng(index)
         )
         return {"blur": img_blur, "gt": img_gt, "event": event_tensor}
 
@@ -174,6 +185,8 @@ class ImageEventDeblurDataset(Dataset):
         self.norm_event = opt_dataset.get("norm_event", False)
         self.event_bins = opt_dataset.get("event_bins", 6)
         self.event_ext = opt_dataset.get("event_ext")
+        self.seed = opt_dataset.get("seed")
+        self.epoch = 0
 
         self.samples = self._build_samples()
         print(f"Loaded {self.split}: {len(self.samples)} image/event samples.")
@@ -212,6 +225,14 @@ class ImageEventDeblurDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def _sample_rng(self, index):
+        if self.seed is None:
+            return None
+        return random.Random(self.seed + self.epoch * len(self.samples) + index)
+
     def __getitem__(self, index):
         blur_path, gt_path, event_path = self.samples[index]
         blur = _to_chw_float_image(blur_path)
@@ -222,7 +243,7 @@ class ImageEventDeblurDataset(Dataset):
             event = _normalize_event(event)
 
         blur, gt, event = _crop_triplet(
-            blur, gt, event, self.patch_size, self.random_crop
+            blur, gt, event, self.patch_size, self.random_crop, self._sample_rng(index)
         )
         return {"blur": blur, "gt": gt, "event": event}
 
