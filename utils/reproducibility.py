@@ -54,11 +54,17 @@ def capture_rng_state():
     return state
 
 
+def _as_byte_tensor(rng_state):
+    if torch.is_tensor(rng_state):
+        return rng_state.detach().to(device="cpu", dtype=torch.uint8).contiguous()
+    return torch.as_tensor(rng_state, dtype=torch.uint8, device="cpu").contiguous()
+
+
 def restore_rng_state(state):
     if not state:
         return
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
+    torch.set_rng_state(_as_byte_tensor(state["torch"]))
     if torch.cuda.is_available() and "cuda" in state:
-        torch.cuda.set_rng_state(state["cuda"])
+        torch.cuda.set_rng_state(_as_byte_tensor(state["cuda"]))
