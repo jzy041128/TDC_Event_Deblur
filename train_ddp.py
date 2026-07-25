@@ -250,6 +250,7 @@ def main():
         f"cross_attn_type: {model_cfg.get('cross_attn_type', 'window')} | "
         f"single_ca_order: {model_cfg.get('single_ca_order', 'event2d_k_event3d_v')} | "
         f"cascaded_ca_order: {model_cfg.get('cascaded_ca_order', 'motion_then_struct')} | "
+        f"swapped_kv_order: {model_cfg.get('swapped_kv_order', 'event3d_first')} | "
         f"windows(self/cross/time): {model_cfg.get('self_attn_window_size', 8)}/"
         f"{model_cfg.get('cross_attn_window_size', 8)}/{model_cfg.get('temporal_window_size', 2)} | "
         f"num_heads: {model_cfg.get('num_heads', 4)} | "

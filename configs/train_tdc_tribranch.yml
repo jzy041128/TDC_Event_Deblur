@@ -1,20 +1,20 @@
-name: Seed42_CascadedChannelCA_MotionThenStruct_2D_Plain_Server_60ep
+name: Seed42_SwappedKVCascadedCA_E3First_2D_Plain_Server_60ep
 
 model:
   type: progressive_fusion
   base_dim: 32
 
-  # Existing modes: cat / single_ca / cascaded_ca
+  # Main modes: cat / single_ca / cascaded_ca / swapped_kv_cascaded_ca
   # Event aggregation ablations:
   # event_conv          = EventConv only, without cross-attention.
   # event_window_ca     = EventConv + normalized WindowCA + learnable temperature.
   # plain_channel_ca    = EventConv + standard scaled channel cross-attention.
   # channel_ca          = EventConv + normalized channel CA + learnable temperature.
   # event_add_channel_ca = Event2D + mean(Event3D), then normalized channel CA.
-  fusion_mode: cascaded_ca
+  fusion_mode: swapped_kv_cascaded_ca
   # 2d: mean Event3D before fusion; 3d: preserve time until fusion finishes.
   fusion_dim: 2d
-  # Used by single_ca/cascaded_ca: local spatial windows or global channel attention.
+  # Used by single_ca/cascaded_ca/swapped_kv_cascaded_ca.
   cross_attn_type: channel        # window / channel
 
   # Used by single_ca:
@@ -27,6 +27,11 @@ model:
   # struct_then_motion = RGB attends Event2D, then Event3D
   # event_then_rgb     = Event3D attends Event2D, then RGB attends fused event
   cascaded_ca_order: motion_then_struct
+
+  # Used by swapped_kv_cascaded_ca:
+  # event3d_first = CA1(RGB,E3K,E2V), then CA2(RGB1,E2K,E3V)
+  # event2d_first = CA1(RGB,E2K,E3V), then CA2(RGB1,E3K,E2V)
+  swapped_kv_order: event3d_first
 
   # Separate spatial windows for branch self-attention and feature fusion.
   self_attn_window_size: 8
