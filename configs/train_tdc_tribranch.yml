@@ -1,4 +1,4 @@
-name: Seed42_SwappedKVCascadedCA_E3First_2D_Plain_Server_60ep
+name: Seed42_SwappedKV_EncoderRestormerSA_2D_Plain_Server_600ep
 
 model:
   type: progressive_fusion
@@ -33,7 +33,9 @@ model:
   # event2d_first = CA1(RGB,E2K,E3V), then CA2(RGB1,E3K,E2V)
   swapped_kv_order: event3d_first
 
-  # Separate spatial windows for branch self-attention and feature fusion.
+  # Encoder branch self-attention: previous WindowSA / Restormer-style channel SA.
+  encoder_self_attn: restormer_channel  # window / restormer_channel
+  # Used only when encoder_self_attn=window.
   self_attn_window_size: 8
   cross_attn_window_size: 8
   # Used by Event3D self-attention and all 3D fusion modes.
@@ -43,8 +45,12 @@ model:
   qk_norm: false
   gamma_init: 0.1
 
+  # RGB-only deformable local alignment; keep off in the encoder-SA experiment.
+  deform_alignment: none          # none / image_guided
   # Decoder ablation: plain keeps the previous decoder; residual adds a local shortcut in each UpBlock.
   decoder_block: plain            # plain / residual
+  # Optional Restormer-style channel SA after each upsample/skip/conv block.
+  decoder_attention: none         # none / restormer_channel
   # Stage-2 ablation. Keep sam_mode=none when two_stage=false.
   two_stage: false                # false / true
   sam_mode: none                  # none / standard / event_guided
@@ -94,7 +100,7 @@ datasets:
     num_workers: 0
 
 train:
-  num_epochs: 60
+  num_epochs: 600
   learning_rate: 0.0002
   # Use the same seed and deterministic mode for fair ablations.
   seed: 42

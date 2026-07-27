@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import DeformConv2d
 
 from models.tdc_module import ShortTermTDCBlock3D
 
@@ -116,6 +117,132 @@ class ChannelLayerNorm3D(nn.Module):
 
     def forward(self, x):
         return self.norm(x.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3).contiguous()
+
+
+class GatedDconvFFN2D(nn.Module):
+    def __init__(self, channels, expansion_factor=2.0):
+        super().__init__()
+        hidden_channels = int(channels * expansion_factor)
+        self.project_in = nn.Conv2d(channels, hidden_channels * 2, 1)
+        self.dwconv = nn.Conv2d(
+            hidden_channels * 2,
+            hidden_channels * 2,
+            3,
+            padding=1,
+            groups=hidden_channels * 2,
+        )
+        self.project_out = nn.Conv2d(hidden_channels, channels, 1)
+
+    def forward(self, x):
+        x1, x2 = self.dwconv(self.project_in(x)).chunk(2, dim=1)
+        return self.project_out(F.gelu(x1) * x2)
+
+
+class GatedDconvFFN3D(nn.Module):
+    def __init__(self, channels, expansion_factor=2.0):
+        super().__init__()
+        hidden_channels = int(channels * expansion_factor)
+        self.project_in = nn.Conv3d(channels, hidden_channels * 2, 1)
+        self.dwconv = nn.Conv3d(
+            hidden_channels * 2,
+            hidden_channels * 2,
+            3,
+            padding=1,
+            groups=hidden_channels * 2,
+        )
+        self.project_out = nn.Conv3d(hidden_channels, channels, 1)
+
+    def forward(self, x):
+        x1, x2 = self.dwconv(self.project_in(x)).chunk(2, dim=1)
+        return self.project_out(F.gelu(x1) * x2)
+
+
+class RestormerChannelSelfAttention2D(nn.Module):
+    def __init__(self, channels, num_heads):
+        super().__init__()
+        if channels % num_heads:
+            raise ValueError("channels must be divisible by num_heads")
+        self.num_heads = num_heads
+        self.norm1 = ChannelLayerNorm2D(channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
+        self.qkv_dwconv = nn.Conv2d(
+            channels * 3,
+            channels * 3,
+            3,
+            padding=1,
+            groups=channels * 3,
+            bias=False,
+        )
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.project_out = nn.Conv2d(channels, channels, 1, bias=False)
+        self.norm2 = ChannelLayerNorm2D(channels)
+        self.ffn = GatedDconvFFN2D(channels)
+
+    def forward(self, x):
+        residual = x
+        b, c, h, w = x.shape
+        head_dim = c // self.num_heads
+        q, k, v = self.qkv_dwconv(self.qkv(self.norm1(x))).chunk(3, dim=1)
+        q = q.reshape(b, self.num_heads, head_dim, h * w)
+        k = k.reshape(b, self.num_heads, head_dim, h * w)
+        v = v.reshape(b, self.num_heads, head_dim, h * w)
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        weights = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) * self.temperature, dim=-1)
+        attended = torch.matmul(weights, v).view(b, c, h, w)
+        x = residual + self.project_out(attended)
+        return x + self.ffn(self.norm2(x))
+
+
+class RestormerChannelSelfAttention3D(nn.Module):
+    def __init__(self, channels, num_heads):
+        super().__init__()
+        if channels % num_heads:
+            raise ValueError("channels must be divisible by num_heads")
+        self.num_heads = num_heads
+        self.norm1 = ChannelLayerNorm3D(channels)
+        self.qkv = nn.Conv3d(channels, channels * 3, 1, bias=False)
+        self.qkv_dwconv = nn.Conv3d(
+            channels * 3,
+            channels * 3,
+            3,
+            padding=1,
+            groups=channels * 3,
+            bias=False,
+        )
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.project_out = nn.Conv3d(channels, channels, 1, bias=False)
+        self.norm2 = ChannelLayerNorm3D(channels)
+        self.ffn = GatedDconvFFN3D(channels)
+
+    def forward(self, x):
+        residual = x
+        b, c, t, h, w = x.shape
+        head_dim = c // self.num_heads
+        q, k, v = self.qkv_dwconv(self.qkv(self.norm1(x))).chunk(3, dim=1)
+        q = q.reshape(b, self.num_heads, head_dim, t * h * w)
+        k = k.reshape(b, self.num_heads, head_dim, t * h * w)
+        v = v.reshape(b, self.num_heads, head_dim, t * h * w)
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        weights = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) * self.temperature, dim=-1)
+        attended = torch.matmul(weights, v).view(b, c, t, h, w)
+        x = residual + self.project_out(attended)
+        return x + self.ffn(self.norm2(x))
+
+
+class ImageGuidedDeformAlignment2D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.norm = ChannelLayerNorm2D(channels)
+        self.offset = nn.Conv2d(channels, 18, 3, padding=1)
+        self.deform = DeformConv2d(channels, channels, 3, padding=1)
+        nn.init.zeros_(self.offset.weight)
+        nn.init.zeros_(self.offset.bias)
+
+    def forward(self, x):
+        normalized = self.norm(x)
+        return x + self.deform(normalized, self.offset(normalized))
 
 
 def partition_2d(x, window_size):
@@ -634,23 +761,35 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         single_ca_order="event2d_k_event3d_v",
         cascaded_ca_order="motion_then_struct",
         swapped_kv_order="event3d_first",
+        encoder_self_attn="window",
         self_attn_window_size=8,
         cross_attn_window_size=8,
         temporal_window_size=2,
         num_heads=4,
         qk_norm=False,
         gamma_init=0.1,
+        deform_alignment="none",
         decoder_block="plain",
+        decoder_attention="none",
         two_stage=False,
         sam_mode="none",
         refine_type="shallow",
     ):
         super().__init__()
+        encoder_self_attn = encoder_self_attn.lower()
+        deform_alignment = deform_alignment.lower()
         decoder_block = decoder_block.lower()
+        decoder_attention = decoder_attention.lower()
         sam_mode = sam_mode.lower()
         refine_type = refine_type.lower()
+        if encoder_self_attn not in {"window", "restormer_channel"}:
+            raise ValueError(f"Unknown encoder_self_attn: {encoder_self_attn}")
+        if deform_alignment not in {"none", "image_guided"}:
+            raise ValueError(f"Unknown deform_alignment: {deform_alignment}")
         if decoder_block not in {"plain", "residual"}:
             raise ValueError(f"Unknown decoder_block: {decoder_block}")
+        if decoder_attention not in {"none", "restormer_channel"}:
+            raise ValueError(f"Unknown decoder_attention: {decoder_attention}")
         if sam_mode not in {"none", "standard", "event_guided"}:
             raise ValueError(f"Unknown sam_mode: {sam_mode}")
         if refine_type not in {"shallow", "light_unet"}:
@@ -669,16 +808,37 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         self.event3d_down = nn.ModuleList([
             ShortTermTDCBlock3D(dims[i], dims[i + 1], stride=(1, 2, 2)) for i in range(2)
         ])
-        self.rgb_self_attn = nn.ModuleList([
-            WindowSelfAttention2D(dim, self_attn_window_size, num_heads, qk_norm) for dim in dims
-        ])
-        self.event2d_self_attn = nn.ModuleList([
-            WindowSelfAttention2D(dim, self_attn_window_size, num_heads, qk_norm) for dim in dims
-        ])
-        self.event3d_self_attn = nn.ModuleList([
-            WindowSelfAttention3D(dim, self_attn_window_size, temporal_window_size, num_heads, qk_norm)
+        self.rgb_alignment = nn.ModuleList([
+            ImageGuidedDeformAlignment2D(dim) if deform_alignment == "image_guided" else nn.Identity()
             for dim in dims
         ])
+        if encoder_self_attn == "window":
+            self.rgb_self_attn = nn.ModuleList([
+                WindowSelfAttention2D(dim, self_attn_window_size, num_heads, qk_norm) for dim in dims
+            ])
+            self.event2d_self_attn = nn.ModuleList([
+                WindowSelfAttention2D(dim, self_attn_window_size, num_heads, qk_norm) for dim in dims
+            ])
+            self.event3d_self_attn = nn.ModuleList([
+                WindowSelfAttention3D(
+                    dim,
+                    self_attn_window_size,
+                    temporal_window_size,
+                    num_heads,
+                    qk_norm,
+                )
+                for dim in dims
+            ])
+        else:
+            self.rgb_self_attn = nn.ModuleList([
+                RestormerChannelSelfAttention2D(dim, num_heads) for dim in dims
+            ])
+            self.event2d_self_attn = nn.ModuleList([
+                RestormerChannelSelfAttention2D(dim, num_heads) for dim in dims
+            ])
+            self.event3d_self_attn = nn.ModuleList([
+                RestormerChannelSelfAttention3D(dim, num_heads) for dim in dims
+            ])
         self.fusions = nn.ModuleList([
             ThreeBranchStageFusion(
                 dim,
@@ -699,6 +859,12 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         up_block = UpBlock if decoder_block == "plain" else ResidualUpBlock
         self.up1 = up_block(dims[2], dims[1], dims[1])
         self.up0 = up_block(dims[1], dims[0], dims[0])
+        if decoder_attention == "restormer_channel":
+            self.up1_attention = RestormerChannelSelfAttention2D(dims[1], num_heads)
+            self.up0_attention = RestormerChannelSelfAttention2D(dims[0], num_heads)
+        else:
+            self.up1_attention = nn.Identity()
+            self.up0_attention = nn.Identity()
         self.reconstruct = nn.Sequential(ConvBlock2D(dims[0], dims[0]), nn.Conv2d(dims[0], rgb_in, 3, padding=1))
         if self.two_stage:
             if self.sam_mode == "standard":
@@ -710,6 +876,7 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
             self.refine = refine_net(dims[0], rgb_in)
 
     def attend(self, scale, rgb, event2d, event3d):
+        rgb = self.rgb_alignment[scale](rgb)
         return (
             self.rgb_self_attn[scale](rgb),
             self.event2d_self_attn[scale](event2d),
@@ -736,8 +903,8 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         rgb, event2d, event3d = self.attend(2, rgb, event2d, event3d)
         fused2 = self.fusions[2](rgb, event2d, event3d)
 
-        x = self.up1(fused2, fused1)
-        x = self.up0(x, fused0)
+        x = self.up1_attention(self.up1(fused2, fused1))
+        x = self.up0_attention(self.up0(x, fused0))
         stage1_image = blur + self.reconstruct(x)
         if not self.two_stage:
             return stage1_image
