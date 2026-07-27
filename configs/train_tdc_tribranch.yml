@@ -1,4 +1,4 @@
-name: Seed42_SwappedKV_EncoderRestormerSA_2D_Plain_Server_600ep
+name: Seed42_SwappedKV_EncoderPlainChannelSA_2D_Plain_Server_600ep
 
 model:
   type: progressive_fusion
@@ -33,8 +33,8 @@ model:
   # event2d_first = CA1(RGB,E2K,E3V), then CA2(RGB1,E3K,E2V)
   swapped_kv_order: event3d_first
 
-  # Encoder branch self-attention: previous WindowSA / Restormer-style channel SA.
-  encoder_self_attn: restormer_channel  # window / restormer_channel
+  # Encoder branch self-attention. plain_channel changes only the attention axis.
+  encoder_self_attn: plain_channel  # window / plain_channel / restormer_channel
   # Used only when encoder_self_attn=window.
   self_attn_window_size: 8
   cross_attn_window_size: 8

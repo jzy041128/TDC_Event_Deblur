@@ -119,6 +119,70 @@ class ChannelLayerNorm3D(nn.Module):
         return self.norm(x.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3).contiguous()
 
 
+class PlainChannelSelfAttention2D(nn.Module):
+    def __init__(self, channels, num_heads, qk_norm=False):
+        super().__init__()
+        if channels % num_heads:
+            raise ValueError("channels must be divisible by num_heads")
+        self.num_heads = num_heads
+        self.qk_norm = qk_norm
+        self.norm = ChannelLayerNorm2D(channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
+        self.proj = nn.Conv2d(channels, channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        residual = x
+        b, c, h, w = x.shape
+        head_dim = c // self.num_heads
+        spatial_dim = h * w
+        q, k, v = self.qkv(self.norm(x)).chunk(3, dim=1)
+        q = q.reshape(b, self.num_heads, head_dim, spatial_dim)
+        k = k.reshape(b, self.num_heads, head_dim, spatial_dim)
+        v = v.reshape(b, self.num_heads, head_dim, spatial_dim)
+        if self.qk_norm:
+            q = F.normalize(q, dim=-1)
+            k = F.normalize(k, dim=-1)
+            scale = 1.0
+        else:
+            scale = spatial_dim ** -0.5
+        weights = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) * scale, dim=-1)
+        attended = torch.matmul(weights, v).reshape(b, c, h, w)
+        return residual + self.gamma * self.proj(attended)
+
+
+class PlainChannelSelfAttention3D(nn.Module):
+    def __init__(self, channels, num_heads, qk_norm=False):
+        super().__init__()
+        if channels % num_heads:
+            raise ValueError("channels must be divisible by num_heads")
+        self.num_heads = num_heads
+        self.qk_norm = qk_norm
+        self.norm = ChannelLayerNorm3D(channels)
+        self.qkv = nn.Conv3d(channels, channels * 3, 1, bias=False)
+        self.proj = nn.Conv3d(channels, channels, 1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        residual = x
+        b, c, t, h, w = x.shape
+        head_dim = c // self.num_heads
+        spatiotemporal_dim = t * h * w
+        q, k, v = self.qkv(self.norm(x)).chunk(3, dim=1)
+        q = q.reshape(b, self.num_heads, head_dim, spatiotemporal_dim)
+        k = k.reshape(b, self.num_heads, head_dim, spatiotemporal_dim)
+        v = v.reshape(b, self.num_heads, head_dim, spatiotemporal_dim)
+        if self.qk_norm:
+            q = F.normalize(q, dim=-1)
+            k = F.normalize(k, dim=-1)
+            scale = 1.0
+        else:
+            scale = spatiotemporal_dim ** -0.5
+        weights = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) * scale, dim=-1)
+        attended = torch.matmul(weights, v).reshape(b, c, t, h, w)
+        return residual + self.gamma * self.proj(attended)
+
+
 class GatedDconvFFN2D(nn.Module):
     def __init__(self, channels, expansion_factor=2.0):
         super().__init__()
@@ -782,7 +846,7 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         decoder_attention = decoder_attention.lower()
         sam_mode = sam_mode.lower()
         refine_type = refine_type.lower()
-        if encoder_self_attn not in {"window", "restormer_channel"}:
+        if encoder_self_attn not in {"window", "plain_channel", "restormer_channel"}:
             raise ValueError(f"Unknown encoder_self_attn: {encoder_self_attn}")
         if deform_alignment not in {"none", "image_guided"}:
             raise ValueError(f"Unknown deform_alignment: {deform_alignment}")
@@ -828,6 +892,16 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
                     qk_norm,
                 )
                 for dim in dims
+            ])
+        elif encoder_self_attn == "plain_channel":
+            self.rgb_self_attn = nn.ModuleList([
+                PlainChannelSelfAttention2D(dim, num_heads, qk_norm) for dim in dims
+            ])
+            self.event2d_self_attn = nn.ModuleList([
+                PlainChannelSelfAttention2D(dim, num_heads, qk_norm) for dim in dims
+            ])
+            self.event3d_self_attn = nn.ModuleList([
+                PlainChannelSelfAttention3D(dim, num_heads, qk_norm) for dim in dims
             ])
         else:
             self.rgb_self_attn = nn.ModuleList([
