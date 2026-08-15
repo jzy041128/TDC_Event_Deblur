@@ -1,4 +1,4 @@
-name: Seed42_SwappedKV_EncoderRestormerWindowSA_2D_Plain_Server_600ep
+name: Seed42_SwappedKV_EncoderRestormerWindowSA_SingleBlock_2D_Plain_Server_600ep
 
 model:
   type: progressive_fusion
@@ -37,7 +37,7 @@ model:
   # window                    = previous fixed non-overlapping WindowSA.
   # plain_channel             = plain global channel SA.
   # restormer_channel         = Restormer-style global channel SA.
-  # restormer_window          = two matched fixed-window Restormer-style blocks.
+  # restormer_window          = one fixed-window Restormer-style block.
   # restormer_shifted_window  = fixed-window block followed by half-window shifted block.
   encoder_self_attn: restormer_window
   # Used by all window-based encoder self-attention modes.

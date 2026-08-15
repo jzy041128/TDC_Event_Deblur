@@ -625,14 +625,16 @@ class RestormerWindowSelfAttention3D(nn.Module):
         return x + self.ffn(self.norm2(x))
 
 
-class RestormerWindowPair2D(nn.Module):
-    def __init__(self, channels, window_size, num_heads, shifted):
+class RestormerShiftedWindowPair2D(nn.Module):
+    def __init__(self, channels, window_size, num_heads):
         super().__init__()
-        second_shift = window_size // 2 if shifted else 0
         self.blocks = nn.Sequential(
             RestormerWindowSelfAttention2D(channels, window_size, num_heads),
             RestormerWindowSelfAttention2D(
-                channels, window_size, num_heads, shift_size=second_shift
+                channels,
+                window_size,
+                num_heads,
+                shift_size=window_size // 2,
             ),
         )
 
@@ -640,17 +642,15 @@ class RestormerWindowPair2D(nn.Module):
         return self.blocks(x)
 
 
-class RestormerWindowPair3D(nn.Module):
+class RestormerShiftedWindowPair3D(nn.Module):
     def __init__(
         self,
         channels,
         spatial_window,
         temporal_window,
         num_heads,
-        shifted,
     ):
         super().__init__()
-        second_shift = spatial_window // 2 if shifted else 0
         self.blocks = nn.Sequential(
             RestormerWindowSelfAttention3D(
                 channels, spatial_window, temporal_window, num_heads
@@ -660,7 +660,7 @@ class RestormerWindowPair3D(nn.Module):
                 spatial_window,
                 temporal_window,
                 num_heads,
-                shift_size=second_shift,
+                shift_size=spatial_window // 2,
             ),
         )
 
@@ -1156,27 +1156,47 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
             self.event3d_self_attn = nn.ModuleList([
                 RestormerChannelSelfAttention3D(dim, num_heads) for dim in dims
             ])
-        else:
-            shifted = encoder_self_attn == "restormer_shifted_window"
+        elif encoder_self_attn == "restormer_window":
             self.rgb_self_attn = nn.ModuleList([
-                RestormerWindowPair2D(
-                    dim, self_attn_window_size, num_heads, shifted
+                RestormerWindowSelfAttention2D(
+                    dim, self_attn_window_size, num_heads
                 )
                 for dim in dims
             ])
             self.event2d_self_attn = nn.ModuleList([
-                RestormerWindowPair2D(
-                    dim, self_attn_window_size, num_heads, shifted
+                RestormerWindowSelfAttention2D(
+                    dim, self_attn_window_size, num_heads
                 )
                 for dim in dims
             ])
             self.event3d_self_attn = nn.ModuleList([
-                RestormerWindowPair3D(
+                RestormerWindowSelfAttention3D(
                     dim,
                     self_attn_window_size,
                     temporal_window_size,
                     num_heads,
-                    shifted,
+                )
+                for dim in dims
+            ])
+        else:
+            self.rgb_self_attn = nn.ModuleList([
+                RestormerShiftedWindowPair2D(
+                    dim, self_attn_window_size, num_heads
+                )
+                for dim in dims
+            ])
+            self.event2d_self_attn = nn.ModuleList([
+                RestormerShiftedWindowPair2D(
+                    dim, self_attn_window_size, num_heads
+                )
+                for dim in dims
+            ])
+            self.event3d_self_attn = nn.ModuleList([
+                RestormerShiftedWindowPair3D(
+                    dim,
+                    self_attn_window_size,
+                    temporal_window_size,
+                    num_heads,
                 )
                 for dim in dims
             ])
