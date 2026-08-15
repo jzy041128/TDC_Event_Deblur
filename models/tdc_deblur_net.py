@@ -382,6 +382,63 @@ def attention(q, k, v, num_heads, qk_norm=False):
     return out.view(batch_windows, tokens, channels)
 
 
+def cosine_window_attention(q, k, v, num_heads, temperature, attn_mask=None):
+    batch_windows, tokens, channels = q.shape
+    head_dim = channels // num_heads
+    q = q.view(batch_windows, tokens, num_heads, head_dim).transpose(1, 2)
+    k = k.view(batch_windows, tokens, num_heads, head_dim).transpose(1, 2)
+    v = v.view(batch_windows, tokens, num_heads, head_dim).transpose(1, 2)
+    q = F.normalize(q, dim=-1)
+    k = F.normalize(k, dim=-1)
+    weights = torch.matmul(q, k.transpose(-2, -1)) * temperature.unsqueeze(0)
+    if attn_mask is not None:
+        num_windows = attn_mask.shape[0]
+        batch_size = batch_windows // num_windows
+        weights = weights.view(batch_size, num_windows, num_heads, tokens, tokens)
+        weights = weights + attn_mask.to(dtype=weights.dtype)[None, :, None, :, :]
+        weights = weights.view(batch_windows, num_heads, tokens, tokens)
+    weights = torch.softmax(weights, dim=-1)
+    out = torch.matmul(weights, v).transpose(1, 2).contiguous()
+    return out.view(batch_windows, tokens, channels)
+
+
+def shifted_window_mask_2d(hp, wp, window_size, shift_size, device):
+    mask = torch.zeros((1, 1, hp, wp), device=device)
+    slices = (
+        slice(0, -window_size),
+        slice(-window_size, -shift_size),
+        slice(-shift_size, None),
+    )
+    region = 0
+    for h_slice in slices:
+        for w_slice in slices:
+            mask[:, :, h_slice, w_slice] = region
+            region += 1
+    windows, _ = partition_2d(mask, window_size)
+    windows = windows.squeeze(-1)
+    differences = windows.unsqueeze(1) - windows.unsqueeze(2)
+    return differences.ne(0).to(mask.dtype) * -100.0
+
+
+def shifted_window_mask_3d(hp, wp, temporal_window, spatial_window, shift_size, device):
+    # The same spatial boundary mask is shared by every temporal-window group.
+    mask = torch.zeros((1, 1, temporal_window, hp, wp), device=device)
+    slices = (
+        slice(0, -spatial_window),
+        slice(-spatial_window, -shift_size),
+        slice(-shift_size, None),
+    )
+    region = 0
+    for h_slice in slices:
+        for w_slice in slices:
+            mask[:, :, :, h_slice, w_slice] = region
+            region += 1
+    windows, _ = partition_3d(mask, temporal_window, spatial_window)
+    windows = windows.squeeze(-1)
+    differences = windows.unsqueeze(1) - windows.unsqueeze(2)
+    return differences.ne(0).to(mask.dtype) * -100.0
+
+
 class WindowSelfAttention2D(nn.Module):
     def __init__(self, channels, window_size, num_heads, qk_norm=False):
         super().__init__()
@@ -429,6 +486,186 @@ class WindowSelfAttention3D(nn.Module):
         out = attention(q, k, v, self.num_heads, self.qk_norm)
         out = reverse_3d(out, shape, self.temporal_window, self.spatial_window)
         return residual + self.gamma * self.proj(out)
+
+
+class RestormerWindowSelfAttention2D(nn.Module):
+    def __init__(self, channels, window_size, num_heads, shift_size=0):
+        super().__init__()
+        if channels % num_heads:
+            raise ValueError("channels must be divisible by num_heads")
+        if not 0 <= shift_size < window_size:
+            raise ValueError("shift_size must be in [0, window_size)")
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.num_heads = num_heads
+        self.norm1 = ChannelLayerNorm2D(channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
+        self.qkv_dwconv = nn.Conv2d(
+            channels * 3,
+            channels * 3,
+            3,
+            padding=1,
+            groups=channels * 3,
+            bias=False,
+        )
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.project_out = nn.Conv2d(channels, channels, 1, bias=False)
+        self.norm2 = ChannelLayerNorm2D(channels)
+        self.ffn = GatedDconvFFN2D(channels)
+        self._mask_cache = {}
+
+    def forward(self, x):
+        residual = x
+        q, k, v = self.qkv_dwconv(self.qkv(self.norm1(x))).chunk(3, dim=1)
+        if self.shift_size:
+            shifts = (-self.shift_size, -self.shift_size)
+            q = torch.roll(q, shifts=shifts, dims=(-2, -1))
+            k = torch.roll(k, shifts=shifts, dims=(-2, -1))
+            v = torch.roll(v, shifts=shifts, dims=(-2, -1))
+        q, shape = partition_2d(q, self.window_size)
+        k, _ = partition_2d(k, self.window_size)
+        v, _ = partition_2d(v, self.window_size)
+        attn_mask = None
+        if self.shift_size:
+            _, _, _, hp, wp = shape
+            mask_key = (hp, wp, q.device.type, q.device.index)
+            attn_mask = self._mask_cache.get(mask_key)
+            if attn_mask is None:
+                attn_mask = shifted_window_mask_2d(
+                    hp, wp, self.window_size, self.shift_size, q.device
+                )
+                self._mask_cache[mask_key] = attn_mask
+        out = cosine_window_attention(
+            q, k, v, self.num_heads, self.temperature, attn_mask
+        )
+        out = reverse_2d(out, shape, self.window_size)
+        if self.shift_size:
+            out = torch.roll(
+                out,
+                shifts=(self.shift_size, self.shift_size),
+                dims=(-2, -1),
+            )
+        x = residual + self.project_out(out)
+        return x + self.ffn(self.norm2(x))
+
+
+class RestormerWindowSelfAttention3D(nn.Module):
+    def __init__(
+        self,
+        channels,
+        spatial_window,
+        temporal_window,
+        num_heads,
+        shift_size=0,
+    ):
+        super().__init__()
+        if channels % num_heads:
+            raise ValueError("channels must be divisible by num_heads")
+        if not 0 <= shift_size < spatial_window:
+            raise ValueError("shift_size must be in [0, spatial_window)")
+        self.spatial_window = spatial_window
+        self.temporal_window = temporal_window
+        self.shift_size = shift_size
+        self.num_heads = num_heads
+        self.norm1 = ChannelLayerNorm3D(channels)
+        self.qkv = nn.Conv3d(channels, channels * 3, 1, bias=False)
+        self.qkv_dwconv = nn.Conv3d(
+            channels * 3,
+            channels * 3,
+            3,
+            padding=1,
+            groups=channels * 3,
+            bias=False,
+        )
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.project_out = nn.Conv3d(channels, channels, 1, bias=False)
+        self.norm2 = ChannelLayerNorm3D(channels)
+        self.ffn = GatedDconvFFN3D(channels)
+        self._mask_cache = {}
+
+    def forward(self, x):
+        residual = x
+        q, k, v = self.qkv_dwconv(self.qkv(self.norm1(x))).chunk(3, dim=1)
+        if self.shift_size:
+            shifts = (-self.shift_size, -self.shift_size)
+            q = torch.roll(q, shifts=shifts, dims=(-2, -1))
+            k = torch.roll(k, shifts=shifts, dims=(-2, -1))
+            v = torch.roll(v, shifts=shifts, dims=(-2, -1))
+        q, shape = partition_3d(q, self.temporal_window, self.spatial_window)
+        k, _ = partition_3d(k, self.temporal_window, self.spatial_window)
+        v, _ = partition_3d(v, self.temporal_window, self.spatial_window)
+        attn_mask = None
+        if self.shift_size:
+            _, _, _, _, _, hp, wp = shape
+            mask_key = (hp, wp, q.device.type, q.device.index)
+            attn_mask = self._mask_cache.get(mask_key)
+            if attn_mask is None:
+                attn_mask = shifted_window_mask_3d(
+                    hp,
+                    wp,
+                    self.temporal_window,
+                    self.spatial_window,
+                    self.shift_size,
+                    q.device,
+                )
+                self._mask_cache[mask_key] = attn_mask
+        out = cosine_window_attention(
+            q, k, v, self.num_heads, self.temperature, attn_mask
+        )
+        out = reverse_3d(
+            out, shape, self.temporal_window, self.spatial_window
+        )
+        if self.shift_size:
+            out = torch.roll(
+                out,
+                shifts=(self.shift_size, self.shift_size),
+                dims=(-2, -1),
+            )
+        x = residual + self.project_out(out)
+        return x + self.ffn(self.norm2(x))
+
+
+class RestormerWindowPair2D(nn.Module):
+    def __init__(self, channels, window_size, num_heads, shifted):
+        super().__init__()
+        second_shift = window_size // 2 if shifted else 0
+        self.blocks = nn.Sequential(
+            RestormerWindowSelfAttention2D(channels, window_size, num_heads),
+            RestormerWindowSelfAttention2D(
+                channels, window_size, num_heads, shift_size=second_shift
+            ),
+        )
+
+    def forward(self, x):
+        return self.blocks(x)
+
+
+class RestormerWindowPair3D(nn.Module):
+    def __init__(
+        self,
+        channels,
+        spatial_window,
+        temporal_window,
+        num_heads,
+        shifted,
+    ):
+        super().__init__()
+        second_shift = spatial_window // 2 if shifted else 0
+        self.blocks = nn.Sequential(
+            RestormerWindowSelfAttention3D(
+                channels, spatial_window, temporal_window, num_heads
+            ),
+            RestormerWindowSelfAttention3D(
+                channels,
+                spatial_window,
+                temporal_window,
+                num_heads,
+                shift_size=second_shift,
+            ),
+        )
+
+    def forward(self, x):
+        return self.blocks(x)
 
 
 class WindowCrossAttention2D(nn.Module):
@@ -846,7 +1083,13 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         decoder_attention = decoder_attention.lower()
         sam_mode = sam_mode.lower()
         refine_type = refine_type.lower()
-        if encoder_self_attn not in {"window", "plain_channel", "restormer_channel"}:
+        if encoder_self_attn not in {
+            "window",
+            "plain_channel",
+            "restormer_channel",
+            "restormer_window",
+            "restormer_shifted_window",
+        }:
             raise ValueError(f"Unknown encoder_self_attn: {encoder_self_attn}")
         if deform_alignment not in {"none", "image_guided"}:
             raise ValueError(f"Unknown deform_alignment: {deform_alignment}")
@@ -903,7 +1146,7 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
             self.event3d_self_attn = nn.ModuleList([
                 PlainChannelSelfAttention3D(dim, num_heads, qk_norm) for dim in dims
             ])
-        else:
+        elif encoder_self_attn == "restormer_channel":
             self.rgb_self_attn = nn.ModuleList([
                 RestormerChannelSelfAttention2D(dim, num_heads) for dim in dims
             ])
@@ -912,6 +1155,30 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
             ])
             self.event3d_self_attn = nn.ModuleList([
                 RestormerChannelSelfAttention3D(dim, num_heads) for dim in dims
+            ])
+        else:
+            shifted = encoder_self_attn == "restormer_shifted_window"
+            self.rgb_self_attn = nn.ModuleList([
+                RestormerWindowPair2D(
+                    dim, self_attn_window_size, num_heads, shifted
+                )
+                for dim in dims
+            ])
+            self.event2d_self_attn = nn.ModuleList([
+                RestormerWindowPair2D(
+                    dim, self_attn_window_size, num_heads, shifted
+                )
+                for dim in dims
+            ])
+            self.event3d_self_attn = nn.ModuleList([
+                RestormerWindowPair3D(
+                    dim,
+                    self_attn_window_size,
+                    temporal_window_size,
+                    num_heads,
+                    shifted,
+                )
+                for dim in dims
             ])
         self.fusions = nn.ModuleList([
             ThreeBranchStageFusion(
