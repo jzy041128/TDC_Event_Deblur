@@ -1,20 +1,22 @@
-name: Seed42_SwappedKV_EncoderRestormerWindowSA_SingleBlock_2D_Plain_Server_600ep
+name: Seed42_ParallelSwappedKVCat_EncoderRestormerShiftedWindowSA_2D_Plain_Server_600ep
 
 model:
   type: progressive_fusion
   base_dim: 32
 
   # Main modes: cat / single_ca / cascaded_ca / swapped_kv_cascaded_ca
+  # parallel_swapped_kv_cat_ca = two independent swapped-KV CAs read the same RGB,
+  #                              then concatenate and project their residual deltas.
   # Event aggregation ablations:
   # event_conv          = EventConv only, without cross-attention.
   # event_window_ca     = EventConv + normalized WindowCA + learnable temperature.
   # plain_channel_ca    = EventConv + standard scaled channel cross-attention.
   # channel_ca          = EventConv + normalized channel CA + learnable temperature.
   # event_add_channel_ca = Event2D + mean(Event3D), then normalized channel CA.
-  fusion_mode: swapped_kv_cascaded_ca
+  fusion_mode: parallel_swapped_kv_cat_ca
   # 2d: mean Event3D before fusion; 3d: preserve time until fusion finishes.
   fusion_dim: 2d
-  # Used by single_ca/cascaded_ca/swapped_kv_cascaded_ca.
+  # Used by single_ca/cascaded_ca/swapped_kv_cascaded_ca/parallel_swapped_kv_cat_ca.
   cross_attn_type: channel        # window / channel
 
   # Used by single_ca:
@@ -28,7 +30,7 @@ model:
   # event_then_rgb     = Event3D attends Event2D, then RGB attends fused event
   cascaded_ca_order: motion_then_struct
 
-  # Used by swapped_kv_cascaded_ca:
+  # Used only by swapped_kv_cascaded_ca (parallel mode always computes both orders):
   # event3d_first = CA1(RGB,E3K,E2V), then CA2(RGB1,E2K,E3V)
   # event2d_first = CA1(RGB,E2K,E3V), then CA2(RGB1,E3K,E2V)
   swapped_kv_order: event3d_first
@@ -39,7 +41,7 @@ model:
   # restormer_channel         = Restormer-style global channel SA.
   # restormer_window          = one fixed-window Restormer-style block.
   # restormer_shifted_window  = fixed-window block followed by half-window shifted block.
-  encoder_self_attn: restormer_window
+  encoder_self_attn: restormer_shifted_window
   # Used by all window-based encoder self-attention modes.
   self_attn_window_size: 8
   cross_attn_window_size: 8

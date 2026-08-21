@@ -872,6 +872,7 @@ class ThreeBranchStageFusion(nn.Module):
             "single_ca",
             "cascaded_ca",
             "swapped_kv_cascaded_ca",
+            "parallel_swapped_kv_cat_ca",
         } | self.TWO_DIM_ONLY_MODES
         if self.fusion_mode not in valid_modes:
             raise ValueError(f"Unknown fusion_mode: {fusion_mode}")
@@ -893,10 +894,12 @@ class ThreeBranchStageFusion(nn.Module):
             raise ValueError(f"Unknown cascaded_ca_order: {cascaded_ca_order}")
         if self.swapped_kv_order not in self.SWAPPED_KV_ORDERS:
             raise ValueError(f"Unknown swapped_kv_order: {swapped_kv_order}")
-        if self.fusion_mode == "swapped_kv_cascaded_ca" and (
+        if self.fusion_mode in {"swapped_kv_cascaded_ca", "parallel_swapped_kv_cat_ca"} and (
             self.fusion_dim != "2d" or self.cross_attn_type != "channel"
         ):
-            raise ValueError("swapped_kv_cascaded_ca requires fusion_dim: 2d and cross_attn_type: channel")
+            raise ValueError(
+                f"{self.fusion_mode} requires fusion_dim: 2d and cross_attn_type: channel"
+            )
 
         if self.fusion_mode == "cat":
             if self.fusion_dim == "2d":
@@ -929,10 +932,16 @@ class ThreeBranchStageFusion(nn.Module):
                 make_ca = lambda: WindowCrossAttention2D(
                     channels, cross_window_size, num_heads, qk_norm
                 )
-            if self.fusion_mode in {"cascaded_ca", "swapped_kv_cascaded_ca"}:
+            if self.fusion_mode in {
+                "cascaded_ca",
+                "swapped_kv_cascaded_ca",
+                "parallel_swapped_kv_cat_ca",
+            }:
                 self.ca1 = make_ca()
                 self.ca2 = make_ca()
                 self.inject2 = nn.Conv2d(channels, channels, 3, padding=1)
+                if self.fusion_mode == "parallel_swapped_kv_cat_ca":
+                    self.parallel_cat = nn.Conv2d(channels * 2, channels, 1)
             else:
                 self.ca = make_ca()
         else:
@@ -951,7 +960,11 @@ class ThreeBranchStageFusion(nn.Module):
                 )
 
         self.gamma1 = nn.Parameter(torch.ones(1) * gamma_init)
-        if self.fusion_mode in {"cascaded_ca", "swapped_kv_cascaded_ca"}:
+        if self.fusion_mode in {
+            "cascaded_ca",
+            "swapped_kv_cascaded_ca",
+            "parallel_swapped_kv_cat_ca",
+        }:
             self.gamma2 = nn.Parameter(torch.ones(1) * gamma_init)
         self.norm_ffn = ChannelLayerNorm2D(channels)
         self.ffn = ConvFFN2D(channels)
@@ -987,6 +1000,13 @@ class ThreeBranchStageFusion(nn.Module):
             return x + self.gamma2 * self.inject2(self.ca2(x, event2d, event3d))
         x = rgb + self.gamma1 * self.inject1(self.ca1(rgb, event2d, event3d))
         return x + self.gamma2 * self.inject2(self.ca2(x, event3d, event2d))
+
+    def parallel_swapped_kv_cat_2d(self, rgb, event2d, event3d):
+        event3d = event3d.mean(dim=2)
+        delta_e3k_e2v = self.gamma1 * self.inject1(self.ca1(rgb, event3d, event2d))
+        delta_e2k_e3v = self.gamma2 * self.inject2(self.ca2(rgb, event2d, event3d))
+        delta = self.parallel_cat(torch.cat([delta_e3k_e2v, delta_e2k_e3v], dim=1))
+        return rgb + delta
 
     def single_3d(self, rgb, event2d, event3d):
         time_steps = event3d.shape[2]
@@ -1043,6 +1063,8 @@ class ThreeBranchStageFusion(nn.Module):
                 fused = self.single_2d(rgb, event2d, event3d)
             elif self.fusion_mode == "swapped_kv_cascaded_ca":
                 fused = self.swapped_kv_cascade_2d(rgb, event2d, event3d)
+            elif self.fusion_mode == "parallel_swapped_kv_cat_ca":
+                fused = self.parallel_swapped_kv_cat_2d(rgb, event2d, event3d)
             else:
                 fused = self.cascade_2d(rgb, event2d, event3d)
         else:
