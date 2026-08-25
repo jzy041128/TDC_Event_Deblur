@@ -251,6 +251,7 @@ def main():
         f"single_ca_order: {model_cfg.get('single_ca_order', 'event2d_k_event3d_v')} | "
         f"cascaded_ca_order: {model_cfg.get('cascaded_ca_order', 'motion_then_struct')} | "
         f"swapped_kv_order: {model_cfg.get('swapped_kv_order', 'event3d_first')} | "
+        f"key_bridge_order: {model_cfg.get('key_bridge_order', 'event3d_first')} | "
         f"encoder_sa: {model_cfg.get('encoder_self_attn', 'window')} | "
         f"deform: {model_cfg.get('deform_alignment', 'none')} | "
         f"windows(self/cross/time): {model_cfg.get('self_attn_window_size', 8)}/"

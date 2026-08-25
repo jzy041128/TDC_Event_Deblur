@@ -837,6 +837,7 @@ class ThreeBranchStageFusion(nn.Module):
     SINGLE_ORDERS = {"event2d_k_event3d_v", "event3d_k_event2d_v"}
     CASCADE_ORDERS = {"motion_then_struct", "struct_then_motion", "event_then_rgb"}
     SWAPPED_KV_ORDERS = {"event3d_first", "event2d_first"}
+    KEY_BRIDGE_ORDERS = {"event3d_first", "event2d_first"}
     TWO_DIM_ONLY_MODES = {
         "channel_ca",
         "event_conv",
@@ -854,6 +855,7 @@ class ThreeBranchStageFusion(nn.Module):
         single_ca_order,
         cascaded_ca_order,
         swapped_kv_order,
+        key_bridge_order,
         cross_window_size,
         temporal_window_size,
         num_heads,
@@ -867,12 +869,14 @@ class ThreeBranchStageFusion(nn.Module):
         self.single_ca_order = single_ca_order.lower()
         self.cascaded_ca_order = cascaded_ca_order.lower()
         self.swapped_kv_order = swapped_kv_order.lower()
+        self.key_bridge_order = key_bridge_order.lower()
         valid_modes = {
             "cat",
             "single_ca",
             "cascaded_ca",
             "swapped_kv_cascaded_ca",
             "parallel_swapped_kv_cat_ca",
+            "mmca_key_bridge_ca",
         } | self.TWO_DIM_ONLY_MODES
         if self.fusion_mode not in valid_modes:
             raise ValueError(f"Unknown fusion_mode: {fusion_mode}")
@@ -894,7 +898,13 @@ class ThreeBranchStageFusion(nn.Module):
             raise ValueError(f"Unknown cascaded_ca_order: {cascaded_ca_order}")
         if self.swapped_kv_order not in self.SWAPPED_KV_ORDERS:
             raise ValueError(f"Unknown swapped_kv_order: {swapped_kv_order}")
-        if self.fusion_mode in {"swapped_kv_cascaded_ca", "parallel_swapped_kv_cat_ca"} and (
+        if self.key_bridge_order not in self.KEY_BRIDGE_ORDERS:
+            raise ValueError(f"Unknown key_bridge_order: {key_bridge_order}")
+        if self.fusion_mode in {
+            "swapped_kv_cascaded_ca",
+            "parallel_swapped_kv_cat_ca",
+            "mmca_key_bridge_ca",
+        } and (
             self.fusion_dim != "2d" or self.cross_attn_type != "channel"
         ):
             raise ValueError(
@@ -936,6 +946,7 @@ class ThreeBranchStageFusion(nn.Module):
                 "cascaded_ca",
                 "swapped_kv_cascaded_ca",
                 "parallel_swapped_kv_cat_ca",
+                "mmca_key_bridge_ca",
             }:
                 self.ca1 = make_ca()
                 self.ca2 = make_ca()
@@ -964,6 +975,7 @@ class ThreeBranchStageFusion(nn.Module):
             "cascaded_ca",
             "swapped_kv_cascaded_ca",
             "parallel_swapped_kv_cat_ca",
+            "mmca_key_bridge_ca",
         }:
             self.gamma2 = nn.Parameter(torch.ones(1) * gamma_init)
         self.norm_ffn = ChannelLayerNorm2D(channels)
@@ -1007,6 +1019,16 @@ class ThreeBranchStageFusion(nn.Module):
         delta_e2k_e3v = self.gamma2 * self.inject2(self.ca2(rgb, event2d, event3d))
         delta = self.parallel_cat(torch.cat([delta_e3k_e2v, delta_e2k_e3v], dim=1))
         return rgb + delta
+
+    def mmca_key_bridge_2d(self, rgb, event2d, event3d):
+        event3d = event3d.mean(dim=2)
+        if self.key_bridge_order == "event3d_first":
+            bridge = self.ca1(rgb, event3d, event3d)
+            x = rgb + self.gamma1 * self.inject1(bridge)
+            return x + self.gamma2 * self.inject2(self.ca2(rgb, bridge, event2d))
+        bridge = self.ca1(rgb, event2d, event2d)
+        x = rgb + self.gamma1 * self.inject1(bridge)
+        return x + self.gamma2 * self.inject2(self.ca2(rgb, bridge, event3d))
 
     def single_3d(self, rgb, event2d, event3d):
         time_steps = event3d.shape[2]
@@ -1065,6 +1087,8 @@ class ThreeBranchStageFusion(nn.Module):
                 fused = self.swapped_kv_cascade_2d(rgb, event2d, event3d)
             elif self.fusion_mode == "parallel_swapped_kv_cat_ca":
                 fused = self.parallel_swapped_kv_cat_2d(rgb, event2d, event3d)
+            elif self.fusion_mode == "mmca_key_bridge_ca":
+                fused = self.mmca_key_bridge_2d(rgb, event2d, event3d)
             else:
                 fused = self.cascade_2d(rgb, event2d, event3d)
         else:
@@ -1084,6 +1108,7 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         single_ca_order="event2d_k_event3d_v",
         cascaded_ca_order="motion_then_struct",
         swapped_kv_order="event3d_first",
+        key_bridge_order="event3d_first",
         encoder_self_attn="window",
         self_attn_window_size=8,
         cross_attn_window_size=8,
@@ -1231,6 +1256,7 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
                 single_ca_order,
                 cascaded_ca_order,
                 swapped_kv_order,
+                key_bridge_order,
                 cross_attn_window_size,
                 temporal_window_size,
                 num_heads,

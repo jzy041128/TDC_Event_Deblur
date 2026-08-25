@@ -1,22 +1,24 @@
-name: Seed42_ParallelSwappedKVCat_EncoderRestormerShiftedWindowSA_2D_Plain_Server_600ep
+name: Seed42_MMCAKeyBridge_E3First_EncoderRestormerShiftedWindowSA_2D_Plain_Server_600ep
 
 model:
   type: progressive_fusion
   base_dim: 32
 
-  # Main modes: cat / single_ca / cascaded_ca / swapped_kv_cascaded_ca
+  # Main modes: cat / single_ca / cascaded_ca / swapped_kv_cascaded_ca / mmca_key_bridge_ca
   # parallel_swapped_kv_cat_ca = two independent swapped-KV CAs read the same RGB,
   #                              then concatenate and project their residual deltas.
+  # mmca_key_bridge_ca = CA1 uses one event as both K/V; its output becomes CA2's K,
+  #                      while CA2 keeps the original RGB as Q and uses the other event as V.
   # Event aggregation ablations:
   # event_conv          = EventConv only, without cross-attention.
   # event_window_ca     = EventConv + normalized WindowCA + learnable temperature.
   # plain_channel_ca    = EventConv + standard scaled channel cross-attention.
   # channel_ca          = EventConv + normalized channel CA + learnable temperature.
   # event_add_channel_ca = Event2D + mean(Event3D), then normalized channel CA.
-  fusion_mode: parallel_swapped_kv_cat_ca
+  fusion_mode: mmca_key_bridge_ca
   # 2d: mean Event3D before fusion; 3d: preserve time until fusion finishes.
   fusion_dim: 2d
-  # Used by single_ca/cascaded_ca/swapped_kv_cascaded_ca/parallel_swapped_kv_cat_ca.
+  # Used by all CA modes, including mmca_key_bridge_ca.
   cross_attn_type: channel        # window / channel
 
   # Used by single_ca:
@@ -34,6 +36,11 @@ model:
   # event3d_first = CA1(RGB,E3K,E2V), then CA2(RGB1,E2K,E3V)
   # event2d_first = CA1(RGB,E2K,E3V), then CA2(RGB1,E3K,E2V)
   swapped_kv_order: event3d_first
+
+  # Used only by mmca_key_bridge_ca:
+  # event3d_first = H1=CA1(RGB,E3K,E3V), then CA2(RGB,H1-as-K,E2V)
+  # event2d_first = H1=CA1(RGB,E2K,E2V), then CA2(RGB,H1-as-K,E3V)
+  key_bridge_order: event3d_first
 
   # Encoder branch self-attention:
   # window                    = previous fixed non-overlapping WindowSA.
