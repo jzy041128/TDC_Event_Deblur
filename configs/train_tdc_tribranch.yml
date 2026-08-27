@@ -1,4 +1,4 @@
-name: Seed42_MMCAKeyBridge_E3First_EncoderRestormerShiftedWindowSA_2D_Plain_Server_600ep
+name: Seed42_EventReorg_B23_EncoderRestormerChannelSA_2D_Plain_Server_600ep
 
 model:
   type: progressive_fusion
@@ -9,13 +9,17 @@ model:
   #                              then concatenate and project their residual deltas.
   # mmca_key_bridge_ca = CA1 uses one event as both K/V; its output becomes CA2's K,
   #                      while CA2 keeps the original RGB as Q and uses the other event as V.
+  # event_reorg_b23_ca = E2 reference reorganizes E3 V; RGB reads via the SAME E2 reference.
+  # event_reorg_b32_ca = E3 reference reorganizes E2 V; RGB reads via the SAME E3 reference.
+  # Both reorg modes use two channel attention maps, no intermediate event residual/projection.
+  # They require 2d/channel and have fewer parameters than swapped_kv_cascaded_ca.
   # Event aggregation ablations:
   # event_conv          = EventConv only, without cross-attention.
   # event_window_ca     = EventConv + normalized WindowCA + learnable temperature.
   # plain_channel_ca    = EventConv + standard scaled channel cross-attention.
   # channel_ca          = EventConv + normalized channel CA + learnable temperature.
   # event_add_channel_ca = Event2D + mean(Event3D), then normalized channel CA.
-  fusion_mode: mmca_key_bridge_ca
+  fusion_mode: event_reorg_b23_ca
   # 2d: mean Event3D before fusion; 3d: preserve time until fusion finishes.
   fusion_dim: 2d
   # Used by all CA modes, including mmca_key_bridge_ca.
@@ -48,7 +52,7 @@ model:
   # restormer_channel         = Restormer-style global channel SA.
   # restormer_window          = one fixed-window Restormer-style block.
   # restormer_shifted_window  = fixed-window block followed by half-window shifted block.
-  encoder_self_attn: restormer_shifted_window
+  encoder_self_attn: restormer_channel
   # Used by all window-based encoder self-attention modes.
   self_attn_window_size: 8
   cross_attn_window_size: 8

@@ -747,6 +747,51 @@ class EventImageChannelCrossAttention2D(nn.Module):
         return self.proj(out)
 
 
+class EventReorganizedChannelCrossAttention2D(nn.Module):
+    """Read event content through a shared reference-channel coordinate system."""
+
+    def __init__(self, channels, num_heads):
+        super().__init__()
+        if channels % num_heads:
+            raise ValueError("channels must be divisible by num_heads")
+        self.num_heads = num_heads
+        self.norm_q = ChannelLayerNorm2D(channels)
+        self.norm_reference = ChannelLayerNorm2D(channels)
+        self.norm_k = ChannelLayerNorm2D(channels)
+        self.norm_v = ChannelLayerNorm2D(channels)
+        self.q = nn.Conv2d(channels, channels, 1, bias=False)
+        self.reference = nn.Conv2d(channels, channels, 1, bias=False)
+        self.k = nn.Conv2d(channels, channels, 1, bias=False)
+        self.v = nn.Conv2d(channels, channels, 1, bias=False)
+        self.temperature_reorg = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.temperature_read = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.proj = nn.Conv2d(channels, channels, 1, bias=False)
+
+    def forward(self, rgb, reference, content):
+        if rgb.shape != reference.shape or rgb.shape != content.shape:
+            raise ValueError("RGB, reference and content features must have the same shape")
+        b, c, h, w = rgb.shape
+        head_shape = (b, self.num_heads, c // self.num_heads, h * w)
+        q = F.normalize(self.q(self.norm_q(rgb)).reshape(head_shape), dim=-1)
+        reference = F.normalize(
+            self.reference(self.norm_reference(reference)).reshape(head_shape), dim=-1
+        )
+        k = F.normalize(self.k(self.norm_k(content)).reshape(head_shape), dim=-1)
+        v = self.v(self.norm_v(content)).reshape(head_shape)
+
+        # The same reference is Q in P and K in A. Keep its channel order between them:
+        # no intermediate output projection, V reprojection or event residual.
+        correspondence = torch.softmax(
+            (reference @ k.transpose(-2, -1)) * self.temperature_reorg, dim=-1
+        )
+        reorganized = correspondence @ v
+        read_weights = torch.softmax(
+            (q @ reference.transpose(-2, -1)) * self.temperature_read, dim=-1
+        )
+        out = (read_weights @ reorganized).reshape(b, c, h, w)
+        return self.proj(out)
+
+
 class PlainChannelCrossAttention2D(nn.Module):
     def __init__(self, channels, num_heads):
         super().__init__()
@@ -838,6 +883,7 @@ class ThreeBranchStageFusion(nn.Module):
     CASCADE_ORDERS = {"motion_then_struct", "struct_then_motion", "event_then_rgb"}
     SWAPPED_KV_ORDERS = {"event3d_first", "event2d_first"}
     KEY_BRIDGE_ORDERS = {"event3d_first", "event2d_first"}
+    EVENT_REORG_MODES = {"event_reorg_b23_ca", "event_reorg_b32_ca"}
     TWO_DIM_ONLY_MODES = {
         "channel_ca",
         "event_conv",
@@ -877,7 +923,7 @@ class ThreeBranchStageFusion(nn.Module):
             "swapped_kv_cascaded_ca",
             "parallel_swapped_kv_cat_ca",
             "mmca_key_bridge_ca",
-        } | self.TWO_DIM_ONLY_MODES
+        } | self.TWO_DIM_ONLY_MODES | self.EVENT_REORG_MODES
         if self.fusion_mode not in valid_modes:
             raise ValueError(f"Unknown fusion_mode: {fusion_mode}")
         if self.fusion_dim not in {"2d", "3d"}:
@@ -900,11 +946,11 @@ class ThreeBranchStageFusion(nn.Module):
             raise ValueError(f"Unknown swapped_kv_order: {swapped_kv_order}")
         if self.key_bridge_order not in self.KEY_BRIDGE_ORDERS:
             raise ValueError(f"Unknown key_bridge_order: {key_bridge_order}")
-        if self.fusion_mode in {
+        if self.fusion_mode in ({
             "swapped_kv_cascaded_ca",
             "parallel_swapped_kv_cat_ca",
             "mmca_key_bridge_ca",
-        } and (
+        } | self.EVENT_REORG_MODES) and (
             self.fusion_dim != "2d" or self.cross_attn_type != "channel"
         ):
             raise ValueError(
@@ -934,6 +980,9 @@ class ThreeBranchStageFusion(nn.Module):
                 self.plain_channel_ca = PlainChannelCrossAttention2D(channels, num_heads)
         elif self.fusion_mode == "event_add_channel_ca":
             self.channel_ca = EventImageChannelCrossAttention2D(channels, num_heads)
+        elif self.fusion_mode in self.EVENT_REORG_MODES:
+            self.event_reorg = EventReorganizedChannelCrossAttention2D(channels, num_heads)
+            self.inject1 = nn.Conv2d(channels, channels, 3, padding=1)
         elif self.fusion_dim == "2d":
             self.inject1 = nn.Conv2d(channels, channels, 3, padding=1)
             if self.cross_attn_type == "channel":
@@ -1030,6 +1079,14 @@ class ThreeBranchStageFusion(nn.Module):
         x = rgb + self.gamma1 * self.inject1(bridge)
         return x + self.gamma2 * self.inject2(self.ca2(rgb, bridge, event3d))
 
+    def event_reorg_2d(self, rgb, event2d, event3d):
+        event3d = event3d.mean(dim=2)
+        if self.fusion_mode == "event_reorg_b23_ca":
+            delta = self.event_reorg(rgb, reference=event2d, content=event3d)
+        else:
+            delta = self.event_reorg(rgb, reference=event3d, content=event2d)
+        return rgb + self.gamma1 * self.inject1(delta)
+
     def single_3d(self, rgb, event2d, event3d):
         time_steps = event3d.shape[2]
         rgb = self.expand_time(rgb, time_steps)
@@ -1089,6 +1146,8 @@ class ThreeBranchStageFusion(nn.Module):
                 fused = self.parallel_swapped_kv_cat_2d(rgb, event2d, event3d)
             elif self.fusion_mode == "mmca_key_bridge_ca":
                 fused = self.mmca_key_bridge_2d(rgb, event2d, event3d)
+            elif self.fusion_mode in self.EVENT_REORG_MODES:
+                fused = self.event_reorg_2d(rgb, event2d, event3d)
             else:
                 fused = self.cascade_2d(rgb, event2d, event3d)
         else:
