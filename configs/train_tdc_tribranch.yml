@@ -1,4 +1,4 @@
-name: Seed42_EventReorg_B23_EncoderRestormerChannelSA_2D_Plain_Server_600ep
+name: Seed42_SoftRoutedDualCA_EncoderRestormerChannelSA_2D_Plain_Server_5GPU_FromScratch_600ep
 
 model:
   type: progressive_fusion
@@ -13,16 +13,24 @@ model:
   # event_reorg_b32_ca = E3 reference reorganizes E2 V; RGB reads via the SAME E3 reference.
   # Both reorg modes use two channel attention maps, no intermediate event residual/projection.
   # They require 2d/channel and have fewer parameters than swapped_kv_cascaded_ca.
+  # Soft-routed dual-attention experiments (all are selected only through fusion_mode):
+  # soft_routed_dual_ca = dynamic complementary routing of concatenated E2/E3 channels,
+  #                       then parallel Channel CA + Window CA with same-source K/V.
+  # fixed_half_dual_ca = same Channel/Window experts, but every input channel is routed 0.5/0.5.
+  # soft_routed_dual_channel_ca = same dynamic router, but both experts are independent Channel CAs.
+  # These modes have no event bypass and no output branch head. Their two outputs are injected
+  # independently into RGB with the existing gamma1/gamma2 residual scales.
   # Event aggregation ablations:
   # event_conv          = EventConv only, without cross-attention.
   # event_window_ca     = EventConv + normalized WindowCA + learnable temperature.
   # plain_channel_ca    = EventConv + standard scaled channel cross-attention.
   # channel_ca          = EventConv + normalized channel CA + learnable temperature.
   # event_add_channel_ca = Event2D + mean(Event3D), then normalized channel CA.
-  fusion_mode: event_reorg_b23_ca
+  fusion_mode: soft_routed_dual_ca
   # 2d: mean Event3D before fusion; 3d: preserve time until fusion finishes.
   fusion_dim: 2d
-  # Used by all CA modes, including mmca_key_bridge_ca.
+  # Legacy selector used by the older CA modes. Keep channel for the three
+  # soft-routed modes; their expert types are fixed directly by fusion_mode.
   cross_attn_type: channel        # window / channel
 
   # Used by single_ca:
