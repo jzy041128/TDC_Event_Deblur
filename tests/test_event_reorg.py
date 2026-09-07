@@ -177,7 +177,9 @@ class EventReorgTests(unittest.TestCase):
     def test_default_config_and_parameter_counts(self):
         with (ROOT / "configs/train_tdc_tribranch.yml").open(encoding="utf-8") as stream:
             config = yaml.safe_load(stream)
-        self.assertEqual(config["model"]["fusion_mode"], "soft_routed_dual_ca")
+        self.assertEqual(
+            config["model"]["fusion_mode"], "bidirectional_event_then_rgb_ca"
+        )
         self.assertEqual(config["model"]["encoder_self_attn"], "restormer_channel")
         self.assertIsNone(config["path"]["resume_state"])
         counts = {}
