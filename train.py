@@ -81,6 +81,10 @@ def parse_best_psnr_from_log(log_path):
                 best = max(best, float(match.group(1)))
     return best
 
+
+def configured_path(path):
+    return path not in (None, '', '~')
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -102,6 +106,9 @@ def main():
 
     # 2. 建立实验文件夹；恢复训练时继续使用 checkpoint 所在目录
     resume_path = config['path'].get('resume_state')
+    pretrain_path = config['path'].get('pretrain_model')
+    if configured_path(resume_path) and configured_path(pretrain_path):
+        raise ValueError('Set only one of path.resume_state and path.pretrain_model.')
     resume_mode = resume_path and resume_path != '~' and os.path.exists(resume_path)
     if resume_mode:
         exp_dir = os.path.dirname(resume_path)
@@ -184,7 +191,16 @@ def main():
     # 6. 👇 核心功能：断点续训 (Resume) 👇
     start_epoch = 0
     best_psnr = 0.0
-    if resume_path and resume_path != '~':
+    if configured_path(pretrain_path):
+        if not os.path.exists(pretrain_path):
+            raise FileNotFoundError(f'Pretrained model not found: {pretrain_path}')
+        checkpoint = torch.load(pretrain_path, map_location=device, weights_only=False)
+        if 'model_state_dict' not in checkpoint:
+            raise KeyError(f'Checkpoint has no model_state_dict: {pretrain_path}')
+        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+        print(f'Loaded pretrained model weights: {pretrain_path}')
+        print('Optimizer is new; training starts from epoch 0 in a new experiment directory.')
+    elif configured_path(resume_path):
         if os.path.exists(resume_path):
             print(f"🔄 发现存档文件！正在从 {resume_path} 恢复训练...")
             checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
@@ -207,6 +223,9 @@ def main():
 
     # 7. 开始训练大循环
     num_epochs = config['train']['num_epochs']
+    val_interval = int(train_cfg.get('val_interval', 1))
+    if val_interval < 1:
+        raise ValueError('train.val_interval must be at least 1.')
     train_start_time = time.time()
     
     for epoch in range(start_epoch, num_epochs):
@@ -243,33 +262,39 @@ def main():
                 print(f"Epoch [{epoch+1}/{num_epochs}], Step [{step+1}/{len(train_loader)}], Loss: {current_loss:.4f}")
 
         avg_train_loss = (epoch_loss / len(train_loader)).item()
-        print(f"\n⏳ Epoch {epoch+1} 训练结束，平均 Loss: {avg_train_loss:.4f}，开始在 Test 集上验证...")
-        model.eval()
-        total_blur_psnr, total_pred_psnr, total_ssim = 0.0, 0.0, 0.0
-        
-        with torch.no_grad():
-            for val_batch in val_loader:
-                val_blur = val_batch['blur'].to(device, non_blocking=True)
-                val_event = val_batch['event'].to(device, non_blocking=True)
-                val_gt = val_batch['gt'].to(device, non_blocking=True)
-                
-                val_pred = model(val_blur, val_event)
-                
-                # 转换格式计算指标
-                pred_np = tensor2float_img(val_pred)
-                blur_np = tensor2float_img(val_blur)
-                gt_np = tensor2float_img(val_gt)
-                
-                # 计算 PSNR 和 SSIM (channel_axis=2 代表颜色通道在最后)
-                total_blur_psnr += calculate_psnr(gt_np, blur_np, data_range=1.0)
-                total_pred_psnr += calculate_psnr(gt_np, pred_np, data_range=1.0)
-                total_ssim += calculate_ssim(gt_np, pred_np, channel_axis=2, data_range=1.0)
-                
-        avg_blur_psnr = total_blur_psnr / len(val_loader)
-        avg_psnr = total_pred_psnr / len(val_loader)
-        avg_ssim = total_ssim / len(val_loader)
-        psnr_gain = avg_psnr - avg_blur_psnr
-        print(f"📈 验证结果 -> Blur PSNR: {avg_blur_psnr:.2f} dB | Pred PSNR: {avg_psnr:.2f} dB | Gain: {psnr_gain:+.2f} dB | SSIM: {avg_ssim:.4f}\n")
+        skip_validation = train_cfg.get('skip_validation', False)
+        should_validate = (
+            not skip_validation
+            and ((epoch + 1) % val_interval == 0 or (epoch + 1) == num_epochs)
+        )
+        avg_psnr = None
+        if should_validate:
+            print(f"\nEpoch {epoch+1} train done, avg loss: {avg_train_loss:.4f}. Validating...")
+            model.eval()
+            total_blur_psnr, total_pred_psnr, total_ssim = 0.0, 0.0, 0.0
+
+            with torch.no_grad():
+                for val_batch in val_loader:
+                    val_blur = val_batch['blur'].to(device, non_blocking=True)
+                    val_event = val_batch['event'].to(device, non_blocking=True)
+                    val_gt = val_batch['gt'].to(device, non_blocking=True)
+                    val_pred = model(val_blur, val_event)
+
+                    pred_np = tensor2float_img(val_pred)
+                    blur_np = tensor2float_img(val_blur)
+                    gt_np = tensor2float_img(val_gt)
+                    total_blur_psnr += calculate_psnr(gt_np, blur_np, data_range=1.0)
+                    total_pred_psnr += calculate_psnr(gt_np, pred_np, data_range=1.0)
+                    total_ssim += calculate_ssim(gt_np, pred_np, channel_axis=2, data_range=1.0)
+
+            avg_blur_psnr = total_blur_psnr / len(val_loader)
+            avg_psnr = total_pred_psnr / len(val_loader)
+            avg_ssim = total_ssim / len(val_loader)
+            psnr_gain = avg_psnr - avg_blur_psnr
+            print(f"Val -> Blur PSNR: {avg_blur_psnr:.2f} dB | Pred PSNR: {avg_psnr:.2f} dB | Gain: {psnr_gain:+.2f} dB | SSIM: {avg_ssim:.4f}\n")
+        else:
+            reason = 'disabled' if skip_validation else f'next interval: every {val_interval} epochs'
+            print(f"\nEpoch {epoch+1} train done, avg loss: {avg_train_loss:.4f}. Validation skipped ({reason}).")
 
         elapsed_total = time.time() - train_start_time
         elapsed_epoch = time.time() - epoch_start_time
@@ -284,7 +309,7 @@ def main():
         )
 
         # --- 存档阶段 (Save Checkpoints) ---
-        is_best = avg_psnr > best_psnr
+        is_best = avg_psnr is not None and avg_psnr > best_psnr
         if is_best:
             best_psnr = avg_psnr
             print(f"✨ 突破历史记录！正在保存最佳模型 (PSNR: {best_psnr:.2f})")
@@ -301,12 +326,6 @@ def main():
         # 1. 每跑完一个 Epoch，覆盖保存一次 latest.pth (防停电)
         torch.save(save_dict, os.path.join(exp_dir, 'latest.pth'))
         if is_best:
-            torch.save(save_dict, os.path.join(exp_dir, 'best.pth'))
-        
-        # 2. 如果分刷出了新高，保存为 best.pth
-        if avg_psnr > best_psnr:
-            best_psnr = avg_psnr
-            print(f"✨ 突破历史记录！正在保存最佳模型 (PSNR: {best_psnr:.2f})")
             torch.save(save_dict, os.path.join(exp_dir, 'best.pth'))
 
 if __name__ == '__main__':

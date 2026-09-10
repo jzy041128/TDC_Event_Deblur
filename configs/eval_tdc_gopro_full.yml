@@ -1,0 +1,42 @@
+name: BidirectionalEventThenRGB4CA_GoPro_FullResolution_Eval
+
+model:
+  type: progressive_fusion
+  base_dim: 32
+  fusion_mode: bidirectional_event_then_rgb_ca
+  fusion_dim: 2d
+  cross_attn_type: channel
+  single_ca_order: event2d_k_event3d_v
+  cascaded_ca_order: motion_then_struct
+  swapped_kv_order: event3d_first
+  key_bridge_order: event3d_first
+  encoder_self_attn: restormer_channel
+  self_attn_window_size: 8
+  cross_attn_window_size: 8
+  temporal_window_size: 2
+  num_heads: 4
+  qk_norm: false
+  gamma_init: 0.1
+  deform_alignment: none
+  decoder_block: plain
+  decoder_attention: none
+  two_stage: false
+  sam_mode: none
+  refine_type: shallow
+
+datasets:
+  val:
+    dataset_type: server_voxel
+    blur_root: /data1/YW/DVS_DATA/voxel_grid/test/blur
+    gt_root: /data1/YW/DVS_DATA/voxel_grid/test/gt
+    event_root: /data1/YW/DVS_DATA/voxel_grid/test/event_0.1_0.1
+    event_ext: .npy
+    event_bins: 6
+    # Null means that evaluation uses the complete image.
+    patch_size: ~
+    norm_event: true
+    num_workers: 0
+
+train:
+  seed: 42
+  deterministic: true

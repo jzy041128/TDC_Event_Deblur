@@ -62,6 +62,9 @@ def _load_event(path, height, width, num_bins):
 
 
 def _crop_triplet(blur, gt, event, patch_size, random_crop=True, rng=None):
+    if patch_size is None:
+        return blur, gt, event
+
     _, h, w = gt.shape
     th, tw = patch_size, patch_size
     if h <= th or w <= tw:

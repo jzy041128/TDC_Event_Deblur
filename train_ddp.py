@@ -115,6 +115,10 @@ def parse_best_psnr_from_log(log_path):
     return best
 
 
+def configured_path(path):
+    return path not in (None, "", "~")
+
+
 def make_experiment_dir(config, resume_path):
     resume_mode = resume_path and resume_path != "~" and os.path.exists(resume_path)
     if resume_mode:
@@ -230,6 +234,9 @@ def main():
     set_global_seed(seed + rank, deterministic)
 
     resume_path = config["path"].get("resume_state")
+    pretrain_path = config["path"].get("pretrain_model")
+    if configured_path(resume_path) and configured_path(pretrain_path):
+        raise ValueError("Set only one of path.resume_state and path.pretrain_model.")
     exp_dir, resume_mode = make_experiment_dir(config, resume_path)
     if rank0():
         sys.stdout = Logger(os.path.join(exp_dir, "train_log.txt"))
@@ -272,7 +279,17 @@ def main():
 
     start_epoch = 0
     best_psnr = 0.0
-    if resume_path and resume_path != "~":
+    if configured_path(pretrain_path):
+        if not os.path.exists(pretrain_path):
+            raise FileNotFoundError(f"Pretrained model not found: {pretrain_path}")
+        checkpoint = torch.load(pretrain_path, map_location=device, weights_only=False)
+        if "model_state_dict" not in checkpoint:
+            raise KeyError(f"Checkpoint has no model_state_dict: {pretrain_path}")
+        unwrap_model(model).load_state_dict(checkpoint["model_state_dict"], strict=True)
+        if rank0():
+            print(f"Loaded pretrained model weights: {pretrain_path}")
+            print("Optimizer is new; training starts from epoch 0 in a new experiment directory.")
+    elif configured_path(resume_path):
         if os.path.exists(resume_path):
             checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
             unwrap_model(model).load_state_dict(checkpoint["model_state_dict"], strict=True)
@@ -290,6 +307,9 @@ def main():
             print(f"Resume path not found: {resume_path}. Start from scratch.")
 
     num_epochs = config["train"]["num_epochs"]
+    val_interval = int(train_cfg.get("val_interval", 1))
+    if val_interval < 1:
+        raise ValueError("train.val_interval must be at least 1.")
     train_start_time = time.time()
     for epoch in range(start_epoch, num_epochs):
         train_sampler.set_epoch(epoch)
@@ -329,18 +349,23 @@ def main():
 
         dist.all_reduce(epoch_loss, op=dist.ReduceOp.SUM)
         avg_train_loss = (epoch_loss / (max(steps_this_epoch, 1) * world_size)).item()
-        avg_psnr = 0.0
         skip_validation = config["train"].get("skip_validation", False)
-        if skip_validation:
-            if rank0():
-                print(f"\nEpoch {epoch+1} train done, avg loss: {avg_train_loss:.4f}. Validation skipped.")
-        else:
+        should_validate = (
+            not skip_validation
+            and ((epoch + 1) % val_interval == 0 or (epoch + 1) == num_epochs)
+        )
+        avg_psnr = None
+        if should_validate:
             if rank0():
                 print(f"\nEpoch {epoch+1} train done, avg loss: {avg_train_loss:.4f}. Validating...")
             avg_blur_psnr, avg_psnr, avg_ssim = validate(model, val_loader, device)
             if rank0():
                 psnr_gain = avg_psnr - avg_blur_psnr
                 print(f"Val -> Blur PSNR: {avg_blur_psnr:.2f} dB | Pred PSNR: {avg_psnr:.2f} dB | Gain: {psnr_gain:+.2f} dB | SSIM: {avg_ssim:.4f}\n")
+        else:
+            if rank0():
+                reason = "disabled" if skip_validation else f"next interval: every {val_interval} epochs"
+                print(f"\nEpoch {epoch+1} train done, avg loss: {avg_train_loss:.4f}. Validation skipped ({reason}).")
 
         rng_states = [None] * world_size
         dist.all_gather_object(rng_states, capture_rng_state())
@@ -355,7 +380,7 @@ def main():
                 f"Elapsed: {format_duration(elapsed_total)} | ETA: {format_duration(eta_seconds)}\n"
             )
 
-            is_best = (not skip_validation) and avg_psnr > best_psnr
+            is_best = avg_psnr is not None and avg_psnr > best_psnr
             if is_best:
                 best_psnr = avg_psnr
                 print(f"New best model, PSNR: {best_psnr:.2f}")
