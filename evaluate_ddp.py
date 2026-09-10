@@ -43,6 +43,18 @@ def parse_args():
         default=None,
         help="Evaluate only the first N samples. Use 1 for a memory smoke test.",
     )
+    parser.add_argument(
+        "--tile-size",
+        type=int,
+        default=None,
+        help="Run inference on overlapping square tiles of this size.",
+    )
+    parser.add_argument(
+        "--tile-overlap",
+        type=int,
+        default=32,
+        help="Overlap in pixels between adjacent inference tiles (default: 32).",
+    )
     return parser.parse_args()
 
 
@@ -69,8 +81,89 @@ def reduce_totals(values, device):
     return totals
 
 
+def tile_starts(length, tile_size, overlap):
+    if length <= tile_size:
+        return [0]
+
+    stride = tile_size - overlap
+    distance = length - tile_size
+    num_steps = (distance + stride - 1) // stride
+    return [round(step * distance / num_steps) for step in range(num_steps + 1)]
+
+
+def feather_weight(height, width, overlap, device, dtype):
+    def axis_weight(length):
+        weight = torch.ones(length, device=device, dtype=dtype)
+        feather = min(overlap, length // 2)
+        if feather > 0:
+            ramp = torch.linspace(
+                1.0 / (feather + 1), 1.0, feather, device=device, dtype=dtype
+            )
+            weight[:feather] = ramp
+            weight[-feather:] = ramp.flip(0)
+        return weight
+
+    return axis_weight(height)[:, None] * axis_weight(width)[None, :]
+
+
+def tiled_forward(model, blur, event, tile_size, overlap):
+    if blur.ndim != 4 or event.ndim != 4:
+        raise ValueError("Tiled inference expects BCHW blur and event tensors.")
+    if blur.shape[0] != 1 or event.shape[0] != 1:
+        raise ValueError("Tiled inference currently requires batch_size=1.")
+    if blur.shape[-2:] != event.shape[-2:]:
+        raise ValueError("Blur and event tensors must have the same spatial size.")
+    if tile_size < 1:
+        raise ValueError("--tile-size must be at least 1.")
+    if overlap < 0 or overlap >= tile_size:
+        raise ValueError("--tile-overlap must satisfy 0 <= overlap < tile_size.")
+
+    height, width = blur.shape[-2:]
+    tile_height = min(tile_size, height)
+    tile_width = min(tile_size, width)
+    if tile_height == height and tile_width == width:
+        return model(blur, event)
+
+    y_starts = tile_starts(height, tile_height, min(overlap, tile_height - 1))
+    x_starts = tile_starts(width, tile_width, min(overlap, tile_width - 1))
+    output_sum = None
+    weight_sum = blur.new_zeros((1, 1, height, width))
+    weight = None
+
+    for y in y_starts:
+        for x in x_starts:
+            blur_tile = blur[:, :, y : y + tile_height, x : x + tile_width]
+            event_tile = event[:, :, y : y + tile_height, x : x + tile_width]
+            pred_tile = model(blur_tile, event_tile)
+            if pred_tile.shape[-2:] != (tile_height, tile_width):
+                raise ValueError(
+                    "Model output size must match the input tile size, got "
+                    f"{tuple(pred_tile.shape[-2:])} for {(tile_height, tile_width)}."
+                )
+            if output_sum is None:
+                output_sum = pred_tile.new_zeros(
+                    (pred_tile.shape[0], pred_tile.shape[1], height, width)
+                )
+
+            if weight is None:
+                weight = feather_weight(
+                    tile_height, tile_width, overlap, pred_tile.device, pred_tile.dtype
+                )[None, None]
+            output_sum[:, :, y : y + tile_height, x : x + tile_width] += (
+                pred_tile * weight
+            )
+            weight_sum[:, :, y : y + tile_height, x : x + tile_width] += weight
+
+    return output_sum / weight_sum.clamp_min(torch.finfo(output_sum.dtype).eps)
+
+
 def main():
     args = parse_args()
+    if args.tile_size is not None:
+        if args.tile_size < 1:
+            raise ValueError("--tile-size must be at least 1.")
+        if args.tile_overlap < 0 or args.tile_overlap >= args.tile_size:
+            raise ValueError("--tile-overlap must satisfy 0 <= overlap < tile size.")
     with open(args.config, "r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
 
@@ -125,6 +218,14 @@ def main():
         print(f"Evaluation samples: {len(dataset)} | world_size: {world_size}")
         print(f"Full resolution: {args.full_resolution}")
         print(
+            "Tiled inference: "
+            + (
+                f"{args.tile_size}x{args.tile_size}, overlap={args.tile_overlap}"
+                if args.tile_size is not None
+                else "disabled"
+            )
+        )
+        print(
             "First sample shapes: "
             f"blur={tuple(first['blur'].shape)} | "
             f"event={tuple(first['event'].shape)} | "
@@ -141,7 +242,12 @@ def main():
             blur = batch["blur"].to(device, non_blocking=True)
             event = batch["event"].to(device, non_blocking=True)
             gt = batch["gt"].to(device, non_blocking=True)
-            pred = model(blur, event)
+            if args.tile_size is None:
+                pred = model(blur, event)
+            else:
+                pred = tiled_forward(
+                    model, blur, event, args.tile_size, args.tile_overlap
+                )
 
             blur_np = tensor_to_float_image(blur)
             pred_np = tensor_to_float_image(pred)
