@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 
 import numpy as np
 import torch
@@ -55,6 +56,12 @@ def parse_args():
         default=32,
         help="Overlap in pixels between adjacent inference tiles (default: 32).",
     )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=10,
+        help="Print progress every N samples processed by rank 0; 0 disables it.",
+    )
     return parser.parse_args()
 
 
@@ -79,6 +86,13 @@ def reduce_totals(values, device):
     if dist.is_initialized():
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
     return totals
+
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def tile_starts(length, tile_size, overlap):
@@ -159,6 +173,8 @@ def tiled_forward(model, blur, event, tile_size, overlap):
 
 def main():
     args = parse_args()
+    if args.log_interval < 0:
+        raise ValueError("--log-interval must be at least 0.")
     if args.tile_size is not None:
         if args.tile_size < 1:
             raise ValueError("--tile-size must be at least 1.")
@@ -236,6 +252,8 @@ def main():
     pred_psnr_sum = 0.0
     ssim_sum = 0.0
     sample_count = 0
+    evaluation_start = time.perf_counter()
+    rank_sample_count = len(sampler)
 
     with torch.inference_mode():
         for batch in loader:
@@ -256,6 +274,24 @@ def main():
             pred_psnr_sum += calculate_psnr(gt_np, pred_np, data_range=1.0)
             ssim_sum += calculate_ssim(gt_np, pred_np, channel_axis=2, data_range=1.0)
             sample_count += 1
+            should_log = args.log_interval > 0 and (
+                sample_count % args.log_interval == 0
+                or sample_count == rank_sample_count
+            )
+            if rank == 0 and should_log:
+                elapsed = time.perf_counter() - evaluation_start
+                estimated_global = min(sample_count * world_size, len(dataset))
+                rate = estimated_global / max(elapsed, 1e-6)
+                remaining = (len(dataset) - estimated_global) / max(rate, 1e-6)
+                percent = 100.0 * estimated_global / len(dataset)
+                running_psnr = pred_psnr_sum / sample_count
+                print(
+                    f"Eval [{estimated_global}/{len(dataset)}] ({percent:.1f}%) | "
+                    f"rank0: {sample_count}/{rank_sample_count} | "
+                    f"rank0 PSNR: {running_psnr:.4f} dB | "
+                    f"speed: {rate:.2f} images/s | ETA: {format_duration(remaining)}",
+                    flush=True,
+                )
 
     totals = reduce_totals(
         [blur_psnr_sum, pred_psnr_sum, ssim_sum, sample_count], device
