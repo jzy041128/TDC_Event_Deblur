@@ -4,55 +4,28 @@ model:
   type: progressive_fusion
   base_dim: 32
 
-  # Main modes: cat / single_ca / cascaded_ca / swapped_kv_cascaded_ca / mmca_key_bridge_ca
+  # Fusion modes with selectable cross-attention:
+  # swapped_kv_cascaded_ca = sequential swapped-K/V fusion.
   # parallel_swapped_kv_cat_ca = two independent swapped-KV CAs read the same RGB,
   #                              then concatenate and project their residual deltas.
-  # mmca_key_bridge_ca = CA1 uses one event as both K/V; its output becomes CA2's K,
-  #                      while CA2 keeps the original RGB as Q and uses the other event as V.
+  # bidirectional_event_then_rgb_ca = cross-enhance E2/E3, then both guide RGB.
+  # independent_event_then_rgb_4ca = parameter-matched four-CA control where E2/E3
+  #                                  are enhanced independently before guiding RGB.
+  # Specialized modes (require cross_attn_type=channel):
   # event_reorg_b23_ca = E2 reference reorganizes E3 V; RGB reads via the SAME E2 reference.
-  # event_reorg_b32_ca = E3 reference reorganizes E2 V; RGB reads via the SAME E3 reference.
-  # Both reorg modes use two channel attention maps, no intermediate event residual/projection.
-  # They require 2d/channel and have fewer parameters than swapped_kv_cascaded_ca.
-  # Soft-routed dual-attention experiment:
   # soft_routed_dual_ca = dynamic complementary routing of concatenated E2/E3 channels,
   #                       then parallel Channel CA + Window CA with same-source K/V.
-  # bidirectional_event_then_rgb_ca = four independent Channel CAs in two stages:
-  #   E2'=E2+CA(E2,E3,E3), E3'=E3+CA(E3,E2,E2),
-  #   then RGB'=RGB+CA(RGB,E2',E2')+CA(RGB,E3',E3').
-  # The first two CAs are parallel and preserve the E2/E3 representation identities.
-  # Event aggregation ablations:
-  # event_conv          = EventConv only, without cross-attention.
-  # event_window_ca     = EventConv + normalized WindowCA + learnable temperature.
-  # plain_channel_ca    = EventConv + standard scaled channel cross-attention.
-  # channel_ca          = EventConv + normalized channel CA + learnable temperature.
-  # event_add_channel_ca = Event2D + mean(Event3D), then normalized channel CA.
   fusion_mode: bidirectional_event_then_rgb_ca
-  # 2d: mean Event3D before fusion; 3d: preserve time until fusion finishes.
+  # Retained fusion modes use mean(Event3D) in 2D fusion space.
   fusion_dim: 2d
-  # Legacy selector used by older CA modes. The bidirectional four-CA mode
-  # requires channel attention and fixes all four CA types internally.
-  cross_attn_type: channel        # window / channel
-
-  # Used by single_ca:
-  # event2d_k_event3d_v = Q:RGB, K:Event2D, V:Event3D
-  # event3d_k_event2d_v = Q:RGB, K:Event3D, V:Event2D
-  single_ca_order: event2d_k_event3d_v
-
-  # Used by cascaded_ca:
-  # motion_then_struct = RGB attends Event3D, then Event2D
-  # struct_then_motion = RGB attends Event2D, then Event3D
-  # event_then_rgb     = Event3D attends Event2D, then RGB attends fused event
-  cascaded_ca_order: motion_then_struct
+  # Used by Swapped-KV, Parallel Swapped-KV and both four-CA modes.
+  # shifted_window is one half-window-shifted CA block, not a fixed+shifted pair.
+  cross_attn_type: channel        # channel / window / shifted_window
 
   # Used only by swapped_kv_cascaded_ca (parallel mode always computes both orders):
   # event3d_first = CA1(RGB,E3K,E2V), then CA2(RGB1,E2K,E3V)
   # event2d_first = CA1(RGB,E2K,E3V), then CA2(RGB1,E3K,E2V)
   swapped_kv_order: event3d_first
-
-  # Used only by mmca_key_bridge_ca:
-  # event3d_first = H1=CA1(RGB,E3K,E3V), then CA2(RGB,H1-as-K,E2V)
-  # event2d_first = H1=CA1(RGB,E2K,E2V), then CA2(RGB,H1-as-K,E3V)
-  key_bridge_order: event3d_first
 
   # Encoder branch self-attention:
   # window                    = previous fixed non-overlapping WindowSA.

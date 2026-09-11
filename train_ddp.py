@@ -252,14 +252,11 @@ def main():
     model_cfg = config.get("model", {})
     print(
         f"Model: three_branch_progressive | base_dim: {model_cfg.get('base_dim', 32)} | "
-        f"fusion_mode: {model_cfg.get('fusion_mode', 'single_ca')} | "
+        f"fusion_mode: {model_cfg.get('fusion_mode', 'bidirectional_event_then_rgb_ca')} | "
         f"fusion_dim: {model_cfg.get('fusion_dim', '2d')} | "
-        f"cross_attn_type: {model_cfg.get('cross_attn_type', 'window')} | "
-        f"single_ca_order: {model_cfg.get('single_ca_order', 'event2d_k_event3d_v')} | "
-        f"cascaded_ca_order: {model_cfg.get('cascaded_ca_order', 'motion_then_struct')} | "
+        f"cross_attn_type: {model_cfg.get('cross_attn_type', 'channel')} | "
         f"swapped_kv_order: {model_cfg.get('swapped_kv_order', 'event3d_first')} | "
-        f"key_bridge_order: {model_cfg.get('key_bridge_order', 'event3d_first')} | "
-        f"encoder_sa: {model_cfg.get('encoder_self_attn', 'window')} | "
+        f"encoder_sa: {model_cfg.get('encoder_self_attn', 'restormer_channel')} | "
         f"deform: {model_cfg.get('deform_alignment', 'none')} | "
         f"windows(self/cross/time): {model_cfg.get('self_attn_window_size', 8)}/"
         f"{model_cfg.get('cross_attn_window_size', 8)}/{model_cfg.get('temporal_window_size', 2)} | "

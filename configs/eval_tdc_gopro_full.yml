@@ -6,10 +6,7 @@ model:
   fusion_mode: bidirectional_event_then_rgb_ca
   fusion_dim: 2d
   cross_attn_type: channel
-  single_ca_order: event2d_k_event3d_v
-  cascaded_ca_order: motion_then_struct
   swapped_kv_order: event3d_first
-  key_bridge_order: event3d_first
   encoder_self_attn: restormer_channel
   self_attn_window_size: 8
   cross_attn_window_size: 8

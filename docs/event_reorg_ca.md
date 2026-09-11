@@ -1,4 +1,4 @@
-# Event-reference channel reorganization (B23 / B32)
+# Event-reference channel reorganization (B23)
 
 This is an input-dependent channel mixing hypothesis, not a guarantee of semantic
 alignment or spatial registration. Existing fusion modes are unchanged.
@@ -6,17 +6,14 @@ alignment or spatial registration. Existing fusion modes are unchanged.
 ## Configuration
 
 - B23: `fusion_mode: event_reorg_b23_ca`. E2 is the reference; E3 supplies content.
-- B32: `fusion_mode: event_reorg_b32_ca`. E3 is the reference; E2 supplies content.
-- Both require `fusion_dim: 2d` and `cross_attn_type: channel`.
-- The checked-in configuration starts B23 from scratch (`resume_state: null`).
-- `single_ca_order`, `cascaded_ca_order`, `swapped_kv_order` and
-  `key_bridge_order` do not affect these two modes.
+- B23 requires `fusion_dim: 2d` and `cross_attn_type: channel`.
+- `swapped_kv_order` does not affect this mode.
 
 ## Per-scale computation
 
 At each of H, H/2 and H/4, let R, E2 and E3 be the post-self-attention branch
 features. Mean E3 over time only for the local fusion computation. Choose
-reference S and content U according to B23/B32 above.
+reference S=E2 and content U=E3.
 
 ```text
 Q = normalize(heads(Wq * LNq(R)))
@@ -60,9 +57,9 @@ additional active training options missing from the new YAML.
 | --- | ---: |
 | Swapped-KV cascade | 2,930,952 |
 | B23 | 2,671,781 |
-| B32 | 2,671,781 |
 
-B23/B32 have 259,171 fewer parameters (8.84%). Both compute two attention maps,
+At the time of the original comparison, B23 had 259,171 fewer parameters
+(8.84%). It computes two attention maps,
 but they share the intermediate reference projection and have one final output
 path instead of two complete CA/projection/residual paths. Do not call this an
 equal-parameter or equal-runtime ablation. No unused layers were added to match
@@ -71,8 +68,7 @@ initial weights across differently parameterized models.
 
 Compare equal training budgets, best/final/last-50 PSNR, SSIM and measured time.
 A higher PSNR would support this information path, not by itself prove semantic
-alignment. B23 and B32 have identical parameterizations and differ only in the
-choice of reference/content source.
+alignment.
 
 ## Local verification
 
@@ -80,10 +76,7 @@ choice of reference/content source.
 python -m unittest discover -s tests -p test_event_reorg.py -v
 ```
 
-Tests cover the explicit two-map formula, one reference projection per forward,
-K/V normalization independence, temporal mean, direction symmetry, residual
-identity, invalid settings, gradients and encoder downsampling routes. CPU tests
-also exercised base_dim=32 forward/backward and two AdamW steps for both modes.
-Eighteen legacy fusion configurations were compared with the pre-change source:
-identical outputs after strict checkpoint loading. No server execution was used;
-server CUDA/DDP performance and peak memory remain to be measured.
+Tests cover the explicit two-map formula, the E2-reference/E3-content route,
+temporal mean and rejection of incompatible attention selectors. No server
+execution was used; server CUDA/DDP performance and peak memory remain to be
+measured.

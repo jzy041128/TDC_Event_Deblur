@@ -365,7 +365,7 @@ def reverse_3d(windows, shape, temporal_window, spatial_window):
     return x[:, :, :t, :h, :w]
 
 
-def attention(q, k, v, num_heads, qk_norm=False):
+def attention(q, k, v, num_heads, qk_norm=False, attn_mask=None):
     batch_windows, tokens, channels = q.shape
     head_dim = channels // num_heads
     q = q.view(batch_windows, tokens, num_heads, head_dim).transpose(1, 2)
@@ -377,7 +377,14 @@ def attention(q, k, v, num_heads, qk_norm=False):
         scale = 1.0
     else:
         scale = head_dim ** -0.5
-    weights = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) * scale, dim=-1)
+    weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+    if attn_mask is not None:
+        num_windows = attn_mask.shape[0]
+        batch_size = batch_windows // num_windows
+        weights = weights.view(batch_size, num_windows, num_heads, tokens, tokens)
+        weights = weights + attn_mask.to(dtype=weights.dtype)[None, :, None, :, :]
+        weights = weights.view(batch_windows, num_heads, tokens, tokens)
+    weights = torch.softmax(weights, dim=-1)
     out = torch.matmul(weights, v).transpose(1, 2).contiguous()
     return out.view(batch_windows, tokens, channels)
 
@@ -669,9 +676,21 @@ class RestormerShiftedWindowPair3D(nn.Module):
 
 
 class WindowCrossAttention2D(nn.Module):
-    def __init__(self, channels, window_size, num_heads, qk_norm=False):
+    def __init__(
+        self,
+        channels,
+        window_size,
+        num_heads,
+        qk_norm=False,
+        shift_size=0,
+    ):
         super().__init__()
+        if channels % num_heads:
+            raise ValueError("channels must be divisible by num_heads")
+        if not 0 <= shift_size < window_size:
+            raise ValueError("shift_size must be in [0, window_size)")
         self.window_size = window_size
+        self.shift_size = shift_size
         self.num_heads = num_heads
         self.qk_norm = qk_norm
         self.norm_q = ChannelLayerNorm2D(channels)
@@ -681,36 +700,48 @@ class WindowCrossAttention2D(nn.Module):
         self.k = nn.Conv2d(channels, channels, 1, bias=False)
         self.v = nn.Conv2d(channels, channels, 1, bias=False)
         self.proj = nn.Conv2d(channels, channels, 1)
+        self._mask_cache = {}
 
     def forward(self, query, key, value):
-        q, shape = partition_2d(self.q(self.norm_q(query)), self.window_size)
-        k, _ = partition_2d(self.k(self.norm_k(key)), self.window_size)
-        v, _ = partition_2d(self.v(self.norm_v(value)), self.window_size)
-        out = attention(q, k, v, self.num_heads, self.qk_norm)
-        return self.proj(reverse_2d(out, shape, self.window_size))
+        if query.shape != key.shape or query.shape != value.shape:
+            raise ValueError("query, key, and value must have the same shape")
+        q = self.q(self.norm_q(query))
+        k = self.k(self.norm_k(key))
+        v = self.v(self.norm_v(value))
+        if self.shift_size:
+            shifts = (-self.shift_size, -self.shift_size)
+            q = torch.roll(q, shifts=shifts, dims=(-2, -1))
+            k = torch.roll(k, shifts=shifts, dims=(-2, -1))
+            v = torch.roll(v, shifts=shifts, dims=(-2, -1))
 
-
-class WindowCrossAttention3D(nn.Module):
-    def __init__(self, channels, spatial_window, temporal_window, num_heads, qk_norm=False):
-        super().__init__()
-        self.spatial_window = spatial_window
-        self.temporal_window = temporal_window
-        self.num_heads = num_heads
-        self.qk_norm = qk_norm
-        self.norm_q = ChannelLayerNorm3D(channels)
-        self.norm_k = ChannelLayerNorm3D(channels)
-        self.norm_v = ChannelLayerNorm3D(channels)
-        self.q = nn.Conv3d(channels, channels, 1, bias=False)
-        self.k = nn.Conv3d(channels, channels, 1, bias=False)
-        self.v = nn.Conv3d(channels, channels, 1, bias=False)
-        self.proj = nn.Conv3d(channels, channels, 1)
-
-    def forward(self, query, key, value):
-        q, shape = partition_3d(self.q(self.norm_q(query)), self.temporal_window, self.spatial_window)
-        k, _ = partition_3d(self.k(self.norm_k(key)), self.temporal_window, self.spatial_window)
-        v, _ = partition_3d(self.v(self.norm_v(value)), self.temporal_window, self.spatial_window)
-        out = attention(q, k, v, self.num_heads, self.qk_norm)
-        out = reverse_3d(out, shape, self.temporal_window, self.spatial_window)
+        q, shape = partition_2d(q, self.window_size)
+        k, _ = partition_2d(k, self.window_size)
+        v, _ = partition_2d(v, self.window_size)
+        attn_mask = None
+        if self.shift_size:
+            _, _, _, hp, wp = shape
+            mask_key = (hp, wp, q.device.type, q.device.index)
+            attn_mask = self._mask_cache.get(mask_key)
+            if attn_mask is None:
+                attn_mask = shifted_window_mask_2d(
+                    hp, wp, self.window_size, self.shift_size, q.device
+                )
+                self._mask_cache[mask_key] = attn_mask
+        out = attention(
+            q,
+            k,
+            v,
+            self.num_heads,
+            self.qk_norm,
+            attn_mask=attn_mask,
+        )
+        out = reverse_2d(out, shape, self.window_size)
+        if self.shift_size:
+            out = torch.roll(
+                out,
+                shifts=(self.shift_size, self.shift_size),
+                dims=(-2, -1),
+            )
         return self.proj(out)
 
 
@@ -852,15 +883,55 @@ class SoftRoutedDualCrossAttention2D(nn.Module):
         return channel_out, second_out
 
 
-class BidirectionalEventThenRGBChannelFusion2D(nn.Module):
-    """Cross-enhance E2/E3 first, then let RGB read both identities."""
+def make_cross_attention_2d(
+    channels,
+    attention_type,
+    window_size,
+    num_heads,
+    qk_norm=False,
+):
+    attention_type = attention_type.lower()
+    if attention_type == "channel":
+        return EventImageChannelCrossAttention2D(channels, num_heads)
+    if attention_type in {"window", "shifted_window"}:
+        shift_size = window_size // 2 if attention_type == "shifted_window" else 0
+        return WindowCrossAttention2D(
+            channels,
+            window_size,
+            num_heads,
+            qk_norm=qk_norm,
+            shift_size=shift_size,
+        )
+    raise ValueError(f"Unknown cross_attn_type: {attention_type}")
 
-    def __init__(self, channels, num_heads, gamma_init):
+
+class EventThenRGBFourCrossAttention2D(nn.Module):
+    """Enhance event identities, then let RGB read both event branches."""
+
+    def __init__(
+        self,
+        channels,
+        attention_type,
+        window_size,
+        num_heads,
+        qk_norm,
+        gamma_init,
+        cross_event,
+    ):
         super().__init__()
-        self.e2_from_e3 = EventImageChannelCrossAttention2D(channels, num_heads)
-        self.e3_from_e2 = EventImageChannelCrossAttention2D(channels, num_heads)
-        self.rgb_from_e2 = EventImageChannelCrossAttention2D(channels, num_heads)
-        self.rgb_from_e3 = EventImageChannelCrossAttention2D(channels, num_heads)
+        make_ca = lambda: make_cross_attention_2d(
+            channels,
+            attention_type,
+            window_size,
+            num_heads,
+            qk_norm,
+        )
+        # Attribute names are retained so existing bidirectional channel checkpoints load.
+        self.e2_from_e3 = make_ca()
+        self.e3_from_e2 = make_ca()
+        self.rgb_from_e2 = make_ca()
+        self.rgb_from_e3 = make_ca()
+        self.cross_event = cross_event
 
         self.inject_e2 = nn.Conv2d(channels, channels, 3, padding=1)
         self.inject_e3 = nn.Conv2d(channels, channels, 3, padding=1)
@@ -878,8 +949,12 @@ class BidirectionalEventThenRGBChannelFusion2D(nn.Module):
                 "RGB, Event2D, and mean Event3D features must have the same shape"
             )
 
-        delta_e2 = self.e2_from_e3(event2d, event3d, event3d)
-        delta_e3 = self.e3_from_e2(event3d, event2d, event2d)
+        if self.cross_event:
+            delta_e2 = self.e2_from_e3(event2d, event3d, event3d)
+            delta_e3 = self.e3_from_e2(event3d, event2d, event2d)
+        else:
+            delta_e2 = self.e2_from_e3(event2d, event2d, event2d)
+            delta_e3 = self.e3_from_e2(event3d, event3d, event3d)
         event2d_enhanced = event2d + self.gamma_e2 * self.inject_e2(delta_e2)
         event3d_enhanced = event3d + self.gamma_e3 * self.inject_e3(delta_e3)
 
@@ -894,77 +969,6 @@ class BidirectionalEventThenRGBChannelFusion2D(nn.Module):
             + self.gamma_rgb_e2 * self.inject_rgb_e2(delta_rgb_e2)
             + self.gamma_rgb_e3 * self.inject_rgb_e3(delta_rgb_e3)
         )
-
-
-class PlainChannelCrossAttention2D(nn.Module):
-    def __init__(self, channels, num_heads):
-        super().__init__()
-        if channels % num_heads:
-            raise ValueError("channels must be divisible by num_heads")
-        self.num_heads = num_heads
-        self.norm_q = ChannelLayerNorm2D(channels)
-        self.norm_kv = ChannelLayerNorm2D(channels)
-        self.q = nn.Conv2d(channels, channels, 1, bias=False)
-        self.k = nn.Conv2d(channels, channels, 1, bias=False)
-        self.v = nn.Conv2d(channels, channels, 1, bias=False)
-        self.proj = nn.Conv2d(channels, channels, 1, bias=False)
-
-    def forward(self, image, event):
-        if image.shape != event.shape:
-            raise ValueError("image and fused event features must have the same shape")
-        b, c, h, w = image.shape
-        head_dim = c // self.num_heads
-        spatial_dim = h * w
-
-        q = self.q(self.norm_q(image)).view(b, self.num_heads, head_dim, spatial_dim)
-        event = self.norm_kv(event)
-        k = self.k(event).view(b, self.num_heads, head_dim, spatial_dim)
-        v = self.v(event).view(b, self.num_heads, head_dim, spatial_dim)
-
-        weights = torch.softmax(
-            torch.matmul(q, k.transpose(-2, -1)) * (spatial_dim ** -0.5), dim=-1
-        )
-        out = torch.matmul(weights, v).view(b, c, h, w)
-        return self.proj(out)
-
-
-class CosineWindowCrossAttention2D(nn.Module):
-    def __init__(self, channels, window_size, num_heads):
-        super().__init__()
-        if channels % num_heads:
-            raise ValueError("channels must be divisible by num_heads")
-        self.window_size = window_size
-        self.num_heads = num_heads
-        self.norm_q = ChannelLayerNorm2D(channels)
-        self.norm_kv = ChannelLayerNorm2D(channels)
-        self.q = nn.Conv2d(channels, channels, 1, bias=False)
-        self.k = nn.Conv2d(channels, channels, 1, bias=False)
-        self.v = nn.Conv2d(channels, channels, 1, bias=False)
-        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
-        self.proj = nn.Conv2d(channels, channels, 1, bias=False)
-
-    def forward(self, image, event):
-        if image.shape != event.shape:
-            raise ValueError("image and fused event features must have the same shape")
-        q, shape = partition_2d(self.q(self.norm_q(image)), self.window_size)
-        event = self.norm_kv(event)
-        k, _ = partition_2d(self.k(event), self.window_size)
-        v, _ = partition_2d(self.v(event), self.window_size)
-
-        batch_windows, tokens, channels = q.shape
-        head_dim = channels // self.num_heads
-        q = q.view(batch_windows, tokens, self.num_heads, head_dim).transpose(1, 2)
-        k = k.view(batch_windows, tokens, self.num_heads, head_dim).transpose(1, 2)
-        v = v.view(batch_windows, tokens, self.num_heads, head_dim).transpose(1, 2)
-        q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
-
-        weights = torch.softmax(
-            torch.matmul(q, k.transpose(-2, -1)) * self.temperature, dim=-1
-        )
-        out = torch.matmul(weights, v).transpose(1, 2).contiguous()
-        out = out.view(batch_windows, tokens, channels)
-        return self.proj(reverse_2d(out, shape, self.window_size))
 
 
 class ConvFFN2D(nn.Module):
@@ -983,20 +987,20 @@ class ConvFFN2D(nn.Module):
 
 
 class ThreeBranchStageFusion(nn.Module):
-    SINGLE_ORDERS = {"event2d_k_event3d_v", "event3d_k_event2d_v"}
-    CASCADE_ORDERS = {"motion_then_struct", "struct_then_motion", "event_then_rgb"}
     SWAPPED_KV_ORDERS = {"event3d_first", "event2d_first"}
-    KEY_BRIDGE_ORDERS = {"event3d_first", "event2d_first"}
-    EVENT_REORG_MODES = {"event_reorg_b23_ca", "event_reorg_b32_ca"}
-    SOFT_ROUTED_DUAL_MODES = {"soft_routed_dual_ca"}
-    BIDIRECTIONAL_EVENT_RGB_MODES = {"bidirectional_event_then_rgb_ca"}
-    TWO_DIM_ONLY_MODES = {
-        "channel_ca",
-        "event_conv",
-        "event_window_ca",
-        "plain_channel_ca",
-        "event_add_channel_ca",
+    SELECTABLE_CA_MODES = {
+        "swapped_kv_cascaded_ca",
+        "parallel_swapped_kv_cat_ca",
+        "bidirectional_event_then_rgb_ca",
+        "independent_event_then_rgb_4ca",
     }
+    EVENT_REORG_MODES = {"event_reorg_b23_ca"}
+    SOFT_ROUTED_DUAL_MODES = {"soft_routed_dual_ca"}
+    FOUR_CA_MODES = {
+        "bidirectional_event_then_rgb_ca",
+        "independent_event_then_rgb_4ca",
+    }
+    VALID_MODES = SELECTABLE_CA_MODES | EVENT_REORG_MODES | SOFT_ROUTED_DUAL_MODES
 
     def __init__(
         self,
@@ -1004,12 +1008,8 @@ class ThreeBranchStageFusion(nn.Module):
         fusion_mode,
         fusion_dim,
         cross_attn_type,
-        single_ca_order,
-        cascaded_ca_order,
         swapped_kv_order,
-        key_bridge_order,
         cross_window_size,
-        temporal_window_size,
         num_heads,
         qk_norm,
         gamma_init,
@@ -1018,86 +1018,22 @@ class ThreeBranchStageFusion(nn.Module):
         self.fusion_mode = fusion_mode.lower()
         self.fusion_dim = fusion_dim.lower()
         self.cross_attn_type = cross_attn_type.lower()
-        self.single_ca_order = single_ca_order.lower()
-        self.cascaded_ca_order = cascaded_ca_order.lower()
         self.swapped_kv_order = swapped_kv_order.lower()
-        self.key_bridge_order = key_bridge_order.lower()
-        valid_modes = {
-            "cat",
-            "single_ca",
-            "cascaded_ca",
-            "swapped_kv_cascaded_ca",
-            "parallel_swapped_kv_cat_ca",
-            "mmca_key_bridge_ca",
-        } | (
-            self.TWO_DIM_ONLY_MODES
-            | self.EVENT_REORG_MODES
-            | self.SOFT_ROUTED_DUAL_MODES
-            | self.BIDIRECTIONAL_EVENT_RGB_MODES
-        )
-        if self.fusion_mode not in valid_modes:
+        if self.fusion_mode not in self.VALID_MODES:
             raise ValueError(f"Unknown fusion_mode: {fusion_mode}")
-        if self.fusion_dim not in {"2d", "3d"}:
-            raise ValueError(f"Unknown fusion_dim: {fusion_dim}")
-        if self.cross_attn_type not in {"window", "channel"}:
-            raise ValueError(f"Unknown cross_attn_type: {cross_attn_type}")
-        if (
-            self.fusion_mode in {"single_ca", "cascaded_ca"}
-            and self.cross_attn_type == "channel"
-            and self.fusion_dim != "2d"
-        ):
-            raise ValueError("cross_attn_type: channel requires fusion_dim: 2d")
-        if self.fusion_mode in self.TWO_DIM_ONLY_MODES and self.fusion_dim != "2d":
+        if self.fusion_dim != "2d":
             raise ValueError(f"fusion_mode: {self.fusion_mode} requires fusion_dim: 2d")
-        if self.single_ca_order not in self.SINGLE_ORDERS:
-            raise ValueError(f"Unknown single_ca_order: {single_ca_order}")
-        if self.cascaded_ca_order not in self.CASCADE_ORDERS:
-            raise ValueError(f"Unknown cascaded_ca_order: {cascaded_ca_order}")
+        if self.cross_attn_type not in {"channel", "window", "shifted_window"}:
+            raise ValueError(f"Unknown cross_attn_type: {cross_attn_type}")
         if self.swapped_kv_order not in self.SWAPPED_KV_ORDERS:
             raise ValueError(f"Unknown swapped_kv_order: {swapped_kv_order}")
-        if self.key_bridge_order not in self.KEY_BRIDGE_ORDERS:
-            raise ValueError(f"Unknown key_bridge_order: {key_bridge_order}")
-        channel_2d_modes = (
-            {
-                "swapped_kv_cascaded_ca",
-                "parallel_swapped_kv_cat_ca",
-                "mmca_key_bridge_ca",
-            }
-            | self.EVENT_REORG_MODES
-            | self.SOFT_ROUTED_DUAL_MODES
-            | self.BIDIRECTIONAL_EVENT_RGB_MODES
-        )
-        if self.fusion_mode in channel_2d_modes and (
-            self.fusion_dim != "2d" or self.cross_attn_type != "channel"
-        ):
+        if self.fusion_mode in (self.EVENT_REORG_MODES | self.SOFT_ROUTED_DUAL_MODES) and self.cross_attn_type != "channel":
             raise ValueError(
-                f"{self.fusion_mode} requires fusion_dim: 2d and cross_attn_type: channel"
+                f"{self.fusion_mode} keeps its specialized design and requires "
+                "cross_attn_type: channel"
             )
 
-        if self.fusion_mode == "cat":
-            if self.fusion_dim == "2d":
-                self.cat = nn.Sequential(ConvBlock2D(channels * 3, channels), nn.Conv2d(channels, channels, 3, padding=1))
-            else:
-                self.cat = nn.Sequential(
-                    nn.Conv3d(channels * 3, channels, 1),
-                    nn.GELU(),
-                    nn.Conv3d(channels, channels, 3, padding=1, groups=channels),
-                    nn.GELU(),
-                    nn.Conv3d(channels, channels, 1),
-                )
-        elif self.fusion_mode in {"channel_ca", "event_conv", "event_window_ca", "plain_channel_ca"}:
-            self.event_aggregate = ConvBlock2D(channels * 2, channels)
-            if self.fusion_mode == "channel_ca":
-                self.channel_ca = EventImageChannelCrossAttention2D(channels, num_heads)
-            elif self.fusion_mode == "event_window_ca":
-                self.event_window_ca = CosineWindowCrossAttention2D(
-                    channels, cross_window_size, num_heads
-                )
-            elif self.fusion_mode == "plain_channel_ca":
-                self.plain_channel_ca = PlainChannelCrossAttention2D(channels, num_heads)
-        elif self.fusion_mode == "event_add_channel_ca":
-            self.channel_ca = EventImageChannelCrossAttention2D(channels, num_heads)
-        elif self.fusion_mode in self.EVENT_REORG_MODES:
+        if self.fusion_mode in self.EVENT_REORG_MODES:
             self.event_reorg = EventReorganizedChannelCrossAttention2D(channels, num_heads)
             self.inject1 = nn.Conv2d(channels, channels, 3, padding=1)
         elif self.fusion_mode in self.SOFT_ROUTED_DUAL_MODES:
@@ -1109,84 +1045,48 @@ class ThreeBranchStageFusion(nn.Module):
             )
             self.inject1 = nn.Conv2d(channels, channels, 3, padding=1)
             self.inject2 = nn.Conv2d(channels, channels, 3, padding=1)
-        elif self.fusion_mode in self.BIDIRECTIONAL_EVENT_RGB_MODES:
-            self.bidirectional_event_rgb = BidirectionalEventThenRGBChannelFusion2D(
-                channels, num_heads, gamma_init
+        elif self.fusion_mode in self.FOUR_CA_MODES:
+            self.bidirectional_event_rgb = EventThenRGBFourCrossAttention2D(
+                channels,
+                self.cross_attn_type,
+                cross_window_size,
+                num_heads,
+                qk_norm,
+                gamma_init,
+                cross_event=self.fusion_mode == "bidirectional_event_then_rgb_ca",
             )
-        elif self.fusion_dim == "2d":
-            self.inject1 = nn.Conv2d(channels, channels, 3, padding=1)
-            if self.cross_attn_type == "channel":
-                make_ca = lambda: EventImageChannelCrossAttention2D(channels, num_heads)
-            else:
-                make_ca = lambda: WindowCrossAttention2D(
-                    channels, cross_window_size, num_heads, qk_norm
-                )
-            if self.fusion_mode in {
-                "cascaded_ca",
-                "swapped_kv_cascaded_ca",
-                "parallel_swapped_kv_cat_ca",
-                "mmca_key_bridge_ca",
-            }:
-                self.ca1 = make_ca()
-                self.ca2 = make_ca()
-                self.inject2 = nn.Conv2d(channels, channels, 3, padding=1)
-                if self.fusion_mode == "parallel_swapped_kv_cat_ca":
-                    self.parallel_cat = nn.Conv2d(channels * 2, channels, 1)
-            else:
-                self.ca = make_ca()
         else:
-            self.inject1 = nn.Conv3d(channels, channels, 3, padding=1)
-            if self.fusion_mode == "cascaded_ca":
-                self.ca1 = WindowCrossAttention3D(
-                    channels, cross_window_size, temporal_window_size, num_heads, qk_norm
-                )
-                self.ca2 = WindowCrossAttention3D(
-                    channels, cross_window_size, temporal_window_size, num_heads, qk_norm
-                )
-                self.inject2 = nn.Conv3d(channels, channels, 3, padding=1)
-            else:
-                self.ca = WindowCrossAttention3D(
-                    channels, cross_window_size, temporal_window_size, num_heads, qk_norm
-                )
+            self.inject1 = nn.Conv2d(channels, channels, 3, padding=1)
+            self.ca1 = make_cross_attention_2d(
+                channels,
+                self.cross_attn_type,
+                cross_window_size,
+                num_heads,
+                qk_norm,
+            )
+            self.ca2 = make_cross_attention_2d(
+                channels,
+                self.cross_attn_type,
+                cross_window_size,
+                num_heads,
+                qk_norm,
+            )
+            self.inject2 = nn.Conv2d(channels, channels, 3, padding=1)
+            if self.fusion_mode == "parallel_swapped_kv_cat_ca":
+                self.parallel_cat = nn.Conv2d(channels * 2, channels, 1)
 
-        if self.fusion_mode not in self.BIDIRECTIONAL_EVENT_RGB_MODES:
+        if self.fusion_mode not in self.FOUR_CA_MODES:
             self.gamma1 = nn.Parameter(torch.ones(1) * gamma_init)
             if self.fusion_mode in {
-                "cascaded_ca",
                 "swapped_kv_cascaded_ca",
                 "parallel_swapped_kv_cat_ca",
-                "mmca_key_bridge_ca",
             } | self.SOFT_ROUTED_DUAL_MODES:
                 self.gamma2 = nn.Parameter(torch.ones(1) * gamma_init)
         self.norm_ffn = ChannelLayerNorm2D(channels)
         self.ffn = ConvFFN2D(channels)
         self.gamma_ffn = nn.Parameter(torch.ones(1) * gamma_init)
 
-    @staticmethod
-    def expand_time(x, time_steps):
-        return x.unsqueeze(2).expand(-1, -1, time_steps, -1, -1)
-
-    def single_2d(self, rgb, event2d, event3d):
-        event3d = event3d.mean(dim=2)
-        if self.single_ca_order == "event2d_k_event3d_v":
-            delta = self.ca(rgb, event2d, event3d)
-        else:
-            delta = self.ca(rgb, event3d, event2d)
-        return rgb + self.gamma1 * self.inject1(delta)
-
-    def cascade_2d(self, rgb, event2d, event3d):
-        event3d = event3d.mean(dim=2)
-        if self.cascaded_ca_order == "motion_then_struct":
-            x = rgb + self.gamma1 * self.inject1(self.ca1(rgb, event3d, event3d))
-            return x + self.gamma2 * self.inject2(self.ca2(x, event2d, event2d))
-        if self.cascaded_ca_order == "struct_then_motion":
-            x = rgb + self.gamma1 * self.inject1(self.ca1(rgb, event2d, event2d))
-            return x + self.gamma2 * self.inject2(self.ca2(x, event3d, event3d))
-        event = event3d + self.gamma1 * self.inject1(self.ca1(event3d, event2d, event2d))
-        return rgb + self.gamma2 * self.inject2(self.ca2(rgb, event, event))
-
     def swapped_kv_cascade_2d(self, rgb, event2d, event3d):
-        event3d = event3d.mean(dim=2)
         if self.swapped_kv_order == "event3d_first":
             x = rgb + self.gamma1 * self.inject1(self.ca1(rgb, event3d, event2d))
             return x + self.gamma2 * self.inject2(self.ca2(x, event2d, event3d))
@@ -1194,32 +1094,16 @@ class ThreeBranchStageFusion(nn.Module):
         return x + self.gamma2 * self.inject2(self.ca2(x, event3d, event2d))
 
     def parallel_swapped_kv_cat_2d(self, rgb, event2d, event3d):
-        event3d = event3d.mean(dim=2)
         delta_e3k_e2v = self.gamma1 * self.inject1(self.ca1(rgb, event3d, event2d))
         delta_e2k_e3v = self.gamma2 * self.inject2(self.ca2(rgb, event2d, event3d))
         delta = self.parallel_cat(torch.cat([delta_e3k_e2v, delta_e2k_e3v], dim=1))
         return rgb + delta
 
-    def mmca_key_bridge_2d(self, rgb, event2d, event3d):
-        event3d = event3d.mean(dim=2)
-        if self.key_bridge_order == "event3d_first":
-            bridge = self.ca1(rgb, event3d, event3d)
-            x = rgb + self.gamma1 * self.inject1(bridge)
-            return x + self.gamma2 * self.inject2(self.ca2(rgb, bridge, event2d))
-        bridge = self.ca1(rgb, event2d, event2d)
-        x = rgb + self.gamma1 * self.inject1(bridge)
-        return x + self.gamma2 * self.inject2(self.ca2(rgb, bridge, event3d))
-
     def event_reorg_2d(self, rgb, event2d, event3d):
-        event3d = event3d.mean(dim=2)
-        if self.fusion_mode == "event_reorg_b23_ca":
-            delta = self.event_reorg(rgb, reference=event2d, content=event3d)
-        else:
-            delta = self.event_reorg(rgb, reference=event3d, content=event2d)
+        delta = self.event_reorg(rgb, reference=event2d, content=event3d)
         return rgb + self.gamma1 * self.inject1(delta)
 
     def soft_routed_dual_2d(self, rgb, event2d, event3d):
-        event3d = event3d.mean(dim=2)
         channel_delta, second_delta = self.soft_routed_dual(rgb, event2d, event3d)
         return (
             rgb
@@ -1227,78 +1111,18 @@ class ThreeBranchStageFusion(nn.Module):
             + self.gamma2 * self.inject2(second_delta)
         )
 
-    def bidirectional_event_then_rgb_2d(self, rgb, event2d, event3d):
-        return self.bidirectional_event_rgb(rgb, event2d, event3d.mean(dim=2))
-
-    def single_3d(self, rgb, event2d, event3d):
-        time_steps = event3d.shape[2]
-        rgb = self.expand_time(rgb, time_steps)
-        event2d = self.expand_time(event2d, time_steps)
-        if self.single_ca_order == "event2d_k_event3d_v":
-            delta = self.ca(rgb, event2d, event3d)
-        else:
-            delta = self.ca(rgb, event3d, event2d)
-        return (rgb + self.gamma1 * self.inject1(delta)).mean(dim=2)
-
-    def cascade_3d(self, rgb, event2d, event3d):
-        time_steps = event3d.shape[2]
-        rgb = self.expand_time(rgb, time_steps)
-        event2d = self.expand_time(event2d, time_steps)
-        if self.cascaded_ca_order == "motion_then_struct":
-            x = rgb + self.gamma1 * self.inject1(self.ca1(rgb, event3d, event3d))
-            x = x + self.gamma2 * self.inject2(self.ca2(x, event2d, event2d))
-        elif self.cascaded_ca_order == "struct_then_motion":
-            x = rgb + self.gamma1 * self.inject1(self.ca1(rgb, event2d, event2d))
-            x = x + self.gamma2 * self.inject2(self.ca2(x, event3d, event3d))
-        else:
-            event = event3d + self.gamma1 * self.inject1(self.ca1(event3d, event2d, event2d))
-            x = rgb + self.gamma2 * self.inject2(self.ca2(rgb, event, event))
-        return x.mean(dim=2)
-
     def forward(self, rgb, event2d, event3d):
-        if self.fusion_mode == "cat":
-            if self.fusion_dim == "2d":
-                delta = self.cat(torch.cat([rgb, event2d, event3d.mean(dim=2)], dim=1))
-            else:
-                time_steps = event3d.shape[2]
-                rgb3d = self.expand_time(rgb, time_steps)
-                event2d3d = self.expand_time(event2d, time_steps)
-                delta = self.cat(torch.cat([rgb3d, event2d3d, event3d], dim=1)).mean(dim=2)
-            fused = rgb + self.gamma1 * delta
-        elif self.fusion_mode == "channel_ca":
-            event = self.event_aggregate(torch.cat([event2d, event3d.mean(dim=2)], dim=1))
-            fused = rgb + self.gamma1 * self.channel_ca(rgb, event)
-        elif self.fusion_mode == "event_conv":
-            event = self.event_aggregate(torch.cat([event2d, event3d.mean(dim=2)], dim=1))
-            fused = rgb + self.gamma1 * event
-        elif self.fusion_mode == "event_window_ca":
-            event = self.event_aggregate(torch.cat([event2d, event3d.mean(dim=2)], dim=1))
-            fused = rgb + self.gamma1 * self.event_window_ca(rgb, event)
-        elif self.fusion_mode == "plain_channel_ca":
-            event = self.event_aggregate(torch.cat([event2d, event3d.mean(dim=2)], dim=1))
-            fused = rgb + self.gamma1 * self.plain_channel_ca(rgb, event)
-        elif self.fusion_mode == "event_add_channel_ca":
-            event = event2d + event3d.mean(dim=2)
-            fused = rgb + self.gamma1 * self.channel_ca(rgb, event)
-        elif self.fusion_dim == "2d":
-            if self.fusion_mode == "single_ca":
-                fused = self.single_2d(rgb, event2d, event3d)
-            elif self.fusion_mode == "swapped_kv_cascaded_ca":
-                fused = self.swapped_kv_cascade_2d(rgb, event2d, event3d)
-            elif self.fusion_mode == "parallel_swapped_kv_cat_ca":
-                fused = self.parallel_swapped_kv_cat_2d(rgb, event2d, event3d)
-            elif self.fusion_mode == "mmca_key_bridge_ca":
-                fused = self.mmca_key_bridge_2d(rgb, event2d, event3d)
-            elif self.fusion_mode in self.EVENT_REORG_MODES:
-                fused = self.event_reorg_2d(rgb, event2d, event3d)
-            elif self.fusion_mode in self.SOFT_ROUTED_DUAL_MODES:
-                fused = self.soft_routed_dual_2d(rgb, event2d, event3d)
-            elif self.fusion_mode in self.BIDIRECTIONAL_EVENT_RGB_MODES:
-                fused = self.bidirectional_event_then_rgb_2d(rgb, event2d, event3d)
-            else:
-                fused = self.cascade_2d(rgb, event2d, event3d)
+        event3d = event3d.mean(dim=2)
+        if self.fusion_mode == "swapped_kv_cascaded_ca":
+            fused = self.swapped_kv_cascade_2d(rgb, event2d, event3d)
+        elif self.fusion_mode == "parallel_swapped_kv_cat_ca":
+            fused = self.parallel_swapped_kv_cat_2d(rgb, event2d, event3d)
+        elif self.fusion_mode in self.EVENT_REORG_MODES:
+            fused = self.event_reorg_2d(rgb, event2d, event3d)
+        elif self.fusion_mode in self.SOFT_ROUTED_DUAL_MODES:
+            fused = self.soft_routed_dual_2d(rgb, event2d, event3d)
         else:
-            fused = self.single_3d(rgb, event2d, event3d) if self.fusion_mode == "single_ca" else self.cascade_3d(rgb, event2d, event3d)
+            fused = self.bidirectional_event_rgb(rgb, event2d, event3d)
         return fused + self.gamma_ffn * self.ffn(self.norm_ffn(fused))
 
 
@@ -1308,14 +1132,11 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         rgb_in=3,
         event_in=6,
         base_dim=32,
-        fusion_mode="single_ca",
+        fusion_mode="bidirectional_event_then_rgb_ca",
         fusion_dim="2d",
-        cross_attn_type="window",
-        single_ca_order="event2d_k_event3d_v",
-        cascaded_ca_order="motion_then_struct",
+        cross_attn_type="channel",
         swapped_kv_order="event3d_first",
-        key_bridge_order="event3d_first",
-        encoder_self_attn="window",
+        encoder_self_attn="restormer_channel",
         self_attn_window_size=8,
         cross_attn_window_size=8,
         temporal_window_size=2,
@@ -1459,12 +1280,8 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
                 fusion_mode,
                 fusion_dim,
                 cross_attn_type,
-                single_ca_order,
-                cascaded_ca_order,
                 swapped_kv_order,
-                key_bridge_order,
                 cross_attn_window_size,
-                temporal_window_size,
                 num_heads,
                 qk_norm,
                 gamma_init,
@@ -1540,6 +1357,13 @@ def build_deblur_model(**model_cfg):
     model_type = model_cfg.pop("model_type", model_cfg.pop("type", "progressive_fusion"))
     if model_type != "progressive_fusion":
         raise ValueError("Only model.type: progressive_fusion is supported by the three-branch network.")
+    # Archived configs may still contain selectors for fusion modes that were removed.
+    for deprecated_key in (
+        "single_ca_order",
+        "cascaded_ca_order",
+        "key_bridge_order",
+    ):
+        model_cfg.pop(deprecated_key, None)
     return ThreeBranchProgressiveDeblurNet(**model_cfg)
 
 

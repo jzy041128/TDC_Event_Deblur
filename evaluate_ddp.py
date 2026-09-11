@@ -280,7 +280,8 @@ def main():
             )
             if rank == 0 and should_log:
                 elapsed = time.perf_counter() - evaluation_start
-                estimated_global = min(sample_count * world_size, len(dataset))
+                progress_cap = len(dataset) if world_size == 1 else len(dataset) - 1
+                estimated_global = min(sample_count * world_size, progress_cap)
                 rate = estimated_global / max(elapsed, 1e-6)
                 remaining = (len(dataset) - estimated_global) / max(rate, 1e-6)
                 percent = 100.0 * estimated_global / len(dataset)
@@ -292,6 +293,11 @@ def main():
                     f"speed: {rate:.2f} images/s | ETA: {format_duration(remaining)}",
                     flush=True,
                 )
+                if world_size > 1 and sample_count == rank_sample_count:
+                    print(
+                        "Rank 0 complete; waiting for the remaining ranks...",
+                        flush=True,
+                    )
 
     totals = reduce_totals(
         [blur_psnr_sum, pred_psnr_sum, ssim_sum, sample_count], device
@@ -308,6 +314,10 @@ def main():
         avg_blur_psnr = totals[0].item() / count
         avg_pred_psnr = totals[1].item() / count
         avg_ssim = totals[2].item() / count
+        print(
+            f"Eval [{int(count)}/{len(dataset)}] (100.0%) | all ranks complete",
+            flush=True,
+        )
         print(
             f"Result -> Blur PSNR: {avg_blur_psnr:.4f} dB | "
             f"Pred PSNR: {avg_pred_psnr:.4f} dB | "
