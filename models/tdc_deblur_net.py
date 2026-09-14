@@ -958,17 +958,56 @@ class EventThenRGBFourCrossAttention2D(nn.Module):
         event2d_enhanced = event2d + self.gamma_e2 * self.inject_e2(delta_e2)
         event3d_enhanced = event3d + self.gamma_e3 * self.inject_e3(delta_e3)
 
-        delta_rgb_e2 = self.rgb_from_e2(
-            rgb, event2d_enhanced, event2d_enhanced
-        )
-        delta_rgb_e3 = self.rgb_from_e3(
-            rgb, event3d_enhanced, event3d_enhanced
-        )
+        return self.fuse_rgb(rgb, event2d_enhanced, event3d_enhanced)
+
+    def fuse_rgb(self, rgb, event2d, event3d):
+        """Let RGB read the two event branches and inject both residuals."""
+        delta_rgb_e2 = self.rgb_from_e2(rgb, event2d, event2d)
+        delta_rgb_e3 = self.rgb_from_e3(rgb, event3d, event3d)
         return (
             rgb
             + self.gamma_rgb_e2 * self.inject_rgb_e2(delta_rgb_e2)
             + self.gamma_rgb_e3 * self.inject_rgb_e3(delta_rgb_e3)
         )
+
+
+class DirectEventToRGBCrossAttention2D(EventThenRGBFourCrossAttention2D):
+    """Ablate event-event enhancement while preserving the RGB fusion path."""
+
+    def __init__(
+        self,
+        channels,
+        attention_type,
+        window_size,
+        num_heads,
+        qk_norm,
+        gamma_init,
+    ):
+        # Build in the original order so retained layers have matched initialization
+        # under the same seed, then remove the ablated event-event path entirely.
+        super().__init__(
+            channels,
+            attention_type,
+            window_size,
+            num_heads,
+            qk_norm,
+            gamma_init,
+            cross_event=True,
+        )
+        del self.e2_from_e3
+        del self.e3_from_e2
+        del self.inject_e2
+        del self.inject_e3
+        del self.gamma_e2
+        del self.gamma_e3
+        del self.cross_event
+
+    def forward(self, rgb, event2d, event3d):
+        if rgb.shape != event2d.shape or rgb.shape != event3d.shape:
+            raise ValueError(
+                "RGB, Event2D, and mean Event3D features must have the same shape"
+            )
+        return self.fuse_rgb(rgb, event2d, event3d)
 
 
 class ConvFFN2D(nn.Module):
@@ -993,6 +1032,7 @@ class ThreeBranchStageFusion(nn.Module):
         "parallel_swapped_kv_cat_ca",
         "bidirectional_event_then_rgb_ca",
         "independent_event_then_rgb_4ca",
+        "direct_event_to_rgb_2ca",
     }
     EVENT_REORG_MODES = {"event_reorg_b23_ca"}
     SOFT_ROUTED_DUAL_MODES = {"soft_routed_dual_ca"}
@@ -1000,6 +1040,8 @@ class ThreeBranchStageFusion(nn.Module):
         "bidirectional_event_then_rgb_ca",
         "independent_event_then_rgb_4ca",
     }
+    DIRECT_EVENT_RGB_MODES = {"direct_event_to_rgb_2ca"}
+    EVENT_THEN_RGB_MODES = FOUR_CA_MODES | DIRECT_EVENT_RGB_MODES
     VALID_MODES = SELECTABLE_CA_MODES | EVENT_REORG_MODES | SOFT_ROUTED_DUAL_MODES
 
     def __init__(
@@ -1055,6 +1097,15 @@ class ThreeBranchStageFusion(nn.Module):
                 gamma_init,
                 cross_event=self.fusion_mode == "bidirectional_event_then_rgb_ca",
             )
+        elif self.fusion_mode in self.DIRECT_EVENT_RGB_MODES:
+            self.bidirectional_event_rgb = DirectEventToRGBCrossAttention2D(
+                channels,
+                self.cross_attn_type,
+                cross_window_size,
+                num_heads,
+                qk_norm,
+                gamma_init,
+            )
         else:
             self.inject1 = nn.Conv2d(channels, channels, 3, padding=1)
             self.ca1 = make_cross_attention_2d(
@@ -1075,7 +1126,7 @@ class ThreeBranchStageFusion(nn.Module):
             if self.fusion_mode == "parallel_swapped_kv_cat_ca":
                 self.parallel_cat = nn.Conv2d(channels * 2, channels, 1)
 
-        if self.fusion_mode not in self.FOUR_CA_MODES:
+        if self.fusion_mode not in self.EVENT_THEN_RGB_MODES:
             self.gamma1 = nn.Parameter(torch.ones(1) * gamma_init)
             if self.fusion_mode in {
                 "swapped_kv_cascaded_ca",

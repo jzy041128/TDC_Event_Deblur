@@ -1,4 +1,4 @@
-name: Seed42_BidirectionalEventThenRGB4CA_EncoderRestormerChannelSA_2D_Plain_Server_5GPU_FromScratch_600ep
+name: Seed42_DirectEventToRGB2CA_EncoderRestormerChannelSA_2D_Plain_Server_5GPU_FromScratch_600ep
 
 model:
   type: progressive_fusion
@@ -11,14 +11,16 @@ model:
   # bidirectional_event_then_rgb_ca = cross-enhance E2/E3, then both guide RGB.
   # independent_event_then_rgb_4ca = parameter-matched four-CA control where E2/E3
   #                                  are enhanced independently before guiding RGB.
+  # direct_event_to_rgb_2ca = remove the two event-event CAs; raw E2/E3 directly
+  #                           guide RGB through the unchanged final two-CA path.
   # Specialized modes (require cross_attn_type=channel):
   # event_reorg_b23_ca = E2 reference reorganizes E3 V; RGB reads via the SAME E2 reference.
   # soft_routed_dual_ca = dynamic complementary routing of concatenated E2/E3 channels,
   #                       then parallel Channel CA + Window CA with same-source K/V.
-  fusion_mode: bidirectional_event_then_rgb_ca
+  fusion_mode: direct_event_to_rgb_2ca
   # Retained fusion modes use mean(Event3D) in 2D fusion space.
   fusion_dim: 2d
-  # Used by Swapped-KV, Parallel Swapped-KV and both four-CA modes.
+  # Used by Swapped-KV, Parallel Swapped-KV, four-CA modes and direct two-CA ablation.
   # shifted_window is one half-window-shifted CA block, not a fixed+shifted pair.
   cross_attn_type: channel        # channel / window / shifted_window
 

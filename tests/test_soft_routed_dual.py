@@ -6,6 +6,7 @@ import torch
 import yaml
 
 from models.tdc_deblur_net import (
+    DirectEventToRGBCrossAttention2D,
     EventImageChannelCrossAttention2D,
     EventThenRGBFourCrossAttention2D,
     SoftRoutedDualCrossAttention2D,
@@ -45,14 +46,14 @@ class FusionModeTests(unittest.TestCase):
             for attention_type in ("channel", "window", "shifted_window"):
                 with self.subTest(mode=mode, attention_type=attention_type):
                     stage = make_stage(mode, attention_type)
-                    if mode in ThreeBranchStageFusion.FOUR_CA_MODES:
+                    if mode in ThreeBranchStageFusion.EVENT_THEN_RGB_MODES:
                         module = stage.bidirectional_event_rgb
-                        attentions = (
-                            module.e2_from_e3,
-                            module.e3_from_e2,
-                            module.rgb_from_e2,
-                            module.rgb_from_e3,
-                        )
+                        attentions = (module.rgb_from_e2, module.rgb_from_e3)
+                        if mode in ThreeBranchStageFusion.FOUR_CA_MODES:
+                            attentions = (
+                                module.e2_from_e3,
+                                module.e3_from_e2,
+                            ) + attentions
                     else:
                         attentions = (stage.ca1, stage.ca2)
                     expected = (
@@ -128,6 +129,64 @@ class FusionModeTests(unittest.TestCase):
                 self.assertIs(e2_k, event2d)
                 self.assertIs(e3_k, event3d)
 
+    def test_direct_two_ca_reuses_only_the_four_ca_rgb_path(self):
+        torch.manual_seed(42)
+        four_ca_stage = make_stage("bidirectional_event_then_rgb_ca")
+        torch.manual_seed(42)
+        direct_stage = make_stage("direct_event_to_rgb_2ca")
+        four_ca = four_ca_stage.bidirectional_event_rgb
+        direct = direct_stage.bidirectional_event_rgb
+
+        self.assertIsInstance(direct, DirectEventToRGBCrossAttention2D)
+        for removed in (
+            "e2_from_e3",
+            "e3_from_e2",
+            "inject_e2",
+            "inject_e3",
+            "gamma_e2",
+            "gamma_e3",
+        ):
+            self.assertFalse(hasattr(direct, removed), removed)
+
+        retained_prefixes = (
+            "rgb_from_e2.",
+            "rgb_from_e3.",
+            "inject_rgb_e2.",
+            "inject_rgb_e3.",
+            "gamma_rgb_e2",
+            "gamma_rgb_e3",
+        )
+        four_state = four_ca.state_dict()
+        direct_state = direct.state_dict()
+        self.assertTrue(
+            all(key.startswith(retained_prefixes) for key in direct_state)
+        )
+        for key, value in direct_state.items():
+            self.assertTrue(torch.equal(value, four_state[key]), key)
+
+        rgb = torch.randn(1, 8, 9, 11)
+        event2d = torch.randn_like(rgb)
+        event3d = torch.randn_like(rgb)
+        calls = {}
+
+        def capture(name):
+            return lambda _module, args: calls.__setitem__(name, args)
+
+        handles = [
+            direct.rgb_from_e2.register_forward_pre_hook(capture("rgb_e2")),
+            direct.rgb_from_e3.register_forward_pre_hook(capture("rgb_e3")),
+        ]
+        output = direct(rgb, event2d, event3d)
+        for handle in handles:
+            handle.remove()
+        self.assertEqual(output.shape, rgb.shape)
+        self.assertEqual(calls["rgb_e2"], (rgb, event2d, event2d))
+        self.assertEqual(calls["rgb_e3"], (rgb, event3d, event3d))
+        self.assertLess(
+            sum(parameter.numel() for parameter in direct.parameters()),
+            sum(parameter.numel() for parameter in four_ca.parameters()),
+        )
+
     def test_soft_routed_keeps_fixed_mixed_experts(self):
         module = make_stage("soft_routed_dual_ca").soft_routed_dual
         self.assertIsInstance(module, SoftRoutedDualCrossAttention2D)
@@ -174,7 +233,7 @@ class FusionModeTests(unittest.TestCase):
         with (ROOT / "configs/train_tdc_tribranch.yml").open(encoding="utf-8") as stream:
             config = yaml.safe_load(stream)
         self.assertEqual(
-            config["model"]["fusion_mode"], "bidirectional_event_then_rgb_ca"
+            config["model"]["fusion_mode"], "direct_event_to_rgb_2ca"
         )
         self.assertEqual(config["model"]["cross_attn_type"], "channel")
         for removed_key in (
