@@ -55,6 +55,21 @@ class REVDDatasetTest(unittest.TestCase):
             )
             self.assertEqual(tuple(dataset[0]["event"].shape), (6, 6, 8))
 
+    def test_unpaired_event_does_not_create_dataset_sample(self):
+        with tempfile.TemporaryDirectory() as root:
+            sequence = self._make_sample(root)
+            np.savez(
+                sequence / "warped_events" / "99999.npz",
+                x=np.array([1.0]),
+                y=np.array([1.0]),
+                t=np.array([100]),
+                p=np.array([1], dtype=np.int16),
+            )
+            dataset = REVDEventDeblurDataset(
+                {"dataroot": root, "patch_size": None, "event_bins": 6}
+            )
+            self.assertEqual(len(dataset), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

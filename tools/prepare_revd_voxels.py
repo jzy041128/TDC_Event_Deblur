@@ -54,7 +54,33 @@ def main():
         parser.error("--bins and --workers must be positive")
 
     dataroot = Path(args.dataroot)
-    event_paths = sorted(dataroot.glob("*/warped_events/*.npz"))
+    blur_paths = sorted(dataroot.glob("*/blur_down/*.png"))
+    event_paths = []
+    missing = []
+    for blur_path in blur_paths:
+        sequence = blur_path.parents[1].name
+        stem = blur_path.stem
+        gt_path = dataroot / sequence / "gt_down_corrected" / f"{stem}.png"
+        event_path = dataroot / sequence / "warped_events" / f"{stem}.npz"
+        if gt_path.exists() and event_path.exists():
+            event_paths.append(event_path)
+        else:
+            missing.append((blur_path, gt_path, event_path))
+    if missing:
+        blur_path, gt_path, event_path = missing[0]
+        raise RuntimeError(
+            f"Found {len(missing)} incomplete RGB-led samples; first: "
+            f"blur={blur_path.exists()}, gt={gt_path.exists()}, "
+            f"event={event_path.exists()}, stem={blur_path.stem}"
+        )
+
+    all_events = set(dataroot.glob("*/warped_events/*.npz"))
+    extra_events = all_events.difference(event_paths)
+    if extra_events:
+        print(
+            f"Ignoring {len(extra_events)} unpaired event files without matching RGB/GT.",
+            flush=True,
+        )
     if args.limit is not None:
         event_paths = event_paths[: args.limit]
     if not event_paths:
