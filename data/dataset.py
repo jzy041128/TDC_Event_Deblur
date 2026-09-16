@@ -20,37 +20,82 @@ def _to_chw_float_image(path):
     return torch.from_numpy(arr)
 
 
-def _event_list_to_voxel(npz_path, height, width, num_bins):
-    data = np.load(npz_path)
-    x = data["x"].astype(np.int64)
-    y = data["y"].astype(np.int64)
-    t = data["t"].astype(np.float32)
-    p = data["p"].astype(np.float32)
+def events_to_voxel(npz_path, height, width, num_bins, mode="hard"):
+    with np.load(npz_path) as data:
+        x = data["x"].astype(np.float64)
+        y = data["y"].astype(np.float64)
+        t = data["t"].astype(np.float64)
+        p = data["p"].astype(np.float32)
 
     voxel = np.zeros((num_bins, height, width), dtype=np.float32)
     if x.size == 0:
         return voxel
 
-    x = np.clip(x, 0, width - 1)
-    y = np.clip(y, 0, height - 1)
+    valid = (
+        np.isfinite(x)
+        & np.isfinite(y)
+        & np.isfinite(t)
+        & (x >= 0)
+        & (x < width)
+        & (y >= 0)
+        & (y < height)
+    )
+    x, y, t, p = x[valid], y[valid], t[valid], p[valid]
+    if x.size == 0:
+        return voxel
+
     polarity = np.where(p > 0, 1.0, -1.0).astype(np.float32)
     t_min = float(t.min())
     t_max = float(t.max())
     if t_max > t_min:
-        bins = ((t - t_min) / (t_max - t_min + 1e-6) * (num_bins - 1)).astype(np.int64)
+        bin_pos = (t - t_min) / (t_max - t_min) * (num_bins - 1)
     else:
-        bins = np.zeros_like(x, dtype=np.int64)
-    bins = np.clip(bins, 0, num_bins - 1)
-    np.add.at(voxel, (bins, y, x), polarity)
+        bin_pos = np.zeros_like(t)
+
+    if mode == "hard":
+        bins = np.clip(bin_pos.astype(np.int64), 0, num_bins - 1)
+        xi = np.clip(x.astype(np.int64), 0, width - 1)
+        yi = np.clip(y.astype(np.int64), 0, height - 1)
+        np.add.at(voxel, (bins, yi, xi), polarity)
+        return voxel
+    if mode != "trilinear":
+        raise ValueError(f"Unknown event voxel mode: {mode}")
+
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    b0 = np.floor(bin_pos).astype(np.int64)
+    x1, y1, b1 = x0 + 1, y0 + 1, np.minimum(b0 + 1, num_bins - 1)
+    wx1 = (x - x0).astype(np.float32)
+    wy1 = (y - y0).astype(np.float32)
+    wb1 = (bin_pos - b0).astype(np.float32)
+
+    flat_indices = []
+    flat_weights = []
+    for bi, wb in ((b0, 1.0 - wb1), (b1, wb1)):
+        for yi, wy in ((y0, 1.0 - wy1), (y1, wy1)):
+            for xi, wx in ((x0, 1.0 - wx1), (x1, wx1)):
+                keep = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
+                if not np.any(keep):
+                    continue
+                flat_indices.append((bi[keep] * height + yi[keep]) * width + xi[keep])
+                flat_weights.append(polarity[keep] * wb[keep] * wy[keep] * wx[keep])
+
+    if flat_indices:
+        counts = np.bincount(
+            np.concatenate(flat_indices),
+            weights=np.concatenate(flat_weights),
+            minlength=num_bins * height * width,
+        )
+        voxel = counts.astype(np.float32, copy=False).reshape(num_bins, height, width)
     return voxel
 
 
-def _load_event(path, height, width, num_bins):
+def _load_event(path, height, width, num_bins, voxel_mode="hard"):
     ext = os.path.splitext(path)[1].lower()
     if ext == ".npy":
         event = np.load(path).astype(np.float32)
     elif ext == ".npz":
-        event = _event_list_to_voxel(path, height, width, num_bins)
+        event = events_to_voxel(path, height, width, num_bins, voxel_mode)
     else:
         raise ValueError(f"Unsupported event file extension: {path}")
 
@@ -188,6 +233,7 @@ class ImageEventDeblurDataset(Dataset):
         self.norm_event = opt_dataset.get("norm_event", False)
         self.event_bins = opt_dataset.get("event_bins", 6)
         self.event_ext = opt_dataset.get("event_ext")
+        self.event_voxel_mode = opt_dataset.get("event_voxel_mode", "hard")
         self.seed = opt_dataset.get("seed")
         self.epoch = 0
 
@@ -241,10 +287,90 @@ class ImageEventDeblurDataset(Dataset):
         blur = _to_chw_float_image(blur_path)
         gt = _to_chw_float_image(gt_path)
         _, height, width = gt.shape
-        event = _load_event(event_path, height, width, self.event_bins)
+        event = _load_event(
+            event_path, height, width, self.event_bins, self.event_voxel_mode
+        )
         if self.norm_event:
             event = _normalize_event(event)
 
+        blur, gt, event = _crop_triplet(
+            blur, gt, event, self.patch_size, self.random_crop, self._sample_rng(index)
+        )
+        return {"blur": blur, "gt": gt, "event": event}
+
+
+class REVDEventDeblurDataset(Dataset):
+    def __init__(self, opt_dataset):
+        super().__init__()
+        self.dataroot = opt_dataset["dataroot"]
+        self.event_cache_root = opt_dataset.get("event_cache_root")
+        self.patch_size = opt_dataset.get("patch_size", 256)
+        self.random_crop = opt_dataset.get("random_crop", True)
+        self.split = opt_dataset.get("split", "dataset")
+        self.norm_event = opt_dataset.get("norm_event", False)
+        self.event_bins = int(opt_dataset.get("event_bins", 6))
+        self.event_voxel_mode = opt_dataset.get("event_voxel_mode", "trilinear")
+        self.seed = opt_dataset.get("seed")
+        self.epoch = 0
+        self.samples = self._build_samples()
+        source = "cached voxels" if self.event_cache_root else "raw events"
+        print(f"Loaded {self.split}: {len(self.samples)} REVD samples ({source}).")
+
+    def _build_samples(self):
+        blur_paths = sorted(
+            glob.glob(os.path.join(self.dataroot, "*", "blur_down", "*.png"))
+        )
+        samples = []
+        incomplete = []
+        for blur_path in blur_paths:
+            sequence_dir = os.path.dirname(os.path.dirname(blur_path))
+            sequence = os.path.basename(sequence_dir)
+            stem = os.path.splitext(os.path.basename(blur_path))[0]
+            gt_path = os.path.join(sequence_dir, "gt_down_corrected", stem + ".png")
+            raw_event_path = os.path.join(sequence_dir, "warped_events", stem + ".npz")
+            event_path = raw_event_path
+            if self.event_cache_root:
+                event_path = os.path.join(self.event_cache_root, sequence, stem + ".npy")
+            if os.path.exists(gt_path) and os.path.exists(event_path):
+                samples.append((blur_path, gt_path, event_path))
+            else:
+                incomplete.append(stem)
+
+        if incomplete:
+            raise RuntimeError(
+                f"Found {len(incomplete)} incomplete REVD samples under {self.dataroot}; "
+                f"first missing sample: {incomplete[0]}"
+            )
+        if not samples:
+            raise RuntimeError(f"No complete REVD samples found under {self.dataroot}")
+        return samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def _sample_rng(self, index):
+        if self.seed is None:
+            return None
+        return random.Random(self.seed + self.epoch * len(self.samples) + index)
+
+    def __getitem__(self, index):
+        blur_path, gt_path, event_path = self.samples[index]
+        blur = _to_chw_float_image(blur_path)
+        gt = _to_chw_float_image(gt_path)
+        _, height, width = gt.shape
+        event = _load_event(
+            event_path, height, width, self.event_bins, self.event_voxel_mode
+        )
+        if event.shape[-2:] != (height, width):
+            raise ValueError(
+                f"Event/image size mismatch: {tuple(event.shape[-2:])} vs "
+                f"{(height, width)} for {event_path}"
+            )
+        if self.norm_event:
+            event = _normalize_event(event)
         blur, gt, event = _crop_triplet(
             blur, gt, event, self.patch_size, self.random_crop, self._sample_rng(index)
         )
@@ -257,6 +383,8 @@ def build_dataset(opt_dataset):
         return H5EventDeblurDataset(opt_dataset)
     if dataset_type in {"image_event", "image_npz", "image_npy", "server_npz", "server_voxel"}:
         return ImageEventDeblurDataset(opt_dataset)
+    if dataset_type == "revd":
+        return REVDEventDeblurDataset(opt_dataset)
     raise ValueError(f"Unknown dataset_type: {dataset_type}")
 
 
