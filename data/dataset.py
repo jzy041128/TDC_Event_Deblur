@@ -106,6 +106,21 @@ def _load_event(path, height, width, num_bins, voxel_mode="hard"):
     return torch.from_numpy(np.ascontiguousarray(event)).float()
 
 
+def _load_precomputed_voxel(path, num_bins):
+    with np.load(path) as data:
+        if "data" not in data:
+            raise KeyError(f"Precomputed voxel has no 'data' array: {path}")
+        event = data["data"].astype(np.float32)
+
+    if event.ndim == 3 and event.shape[0] != num_bins and event.shape[-1] == num_bins:
+        event = np.transpose(event, (2, 0, 1))
+    if event.ndim != 3 or event.shape[0] != num_bins:
+        raise ValueError(
+            f"Expected a {num_bins}-bin CHW voxel, got {event.shape} from {path}"
+        )
+    return torch.from_numpy(np.ascontiguousarray(event)).float()
+
+
 def _crop_triplet(blur, gt, event, patch_size, random_crop=True, rng=None):
     if patch_size is None:
         return blur, gt, event
@@ -377,6 +392,81 @@ class REVDEventDeblurDataset(Dataset):
         return {"blur": blur, "gt": gt, "event": event}
 
 
+class EVRBEventDeblurDataset(Dataset):
+    def __init__(self, opt_dataset):
+        super().__init__()
+        self.dataroot = opt_dataset["dataroot"]
+        self.patch_size = opt_dataset.get("patch_size", 256)
+        self.random_crop = opt_dataset.get("random_crop", True)
+        self.split = opt_dataset.get("split", "dataset")
+        self.norm_event = opt_dataset.get("norm_event", False)
+        self.event_bins = int(opt_dataset.get("event_bins", 16))
+        self.seed = opt_dataset.get("seed")
+        self.epoch = 0
+        self.samples = self._build_samples()
+        print(f"Loaded {self.split}: {len(self.samples)} EVRB samples (official voxels).")
+
+    def _build_samples(self):
+        blur_paths = sorted(
+            glob.glob(os.path.join(self.dataroot, "*", "blur_processed", "*.png"))
+        )
+        samples = []
+        incomplete = []
+        for blur_path in blur_paths:
+            sequence_dir = os.path.dirname(os.path.dirname(blur_path))
+            stem = os.path.splitext(os.path.basename(blur_path))[0]
+            gt_path = os.path.join(sequence_dir, "gt_processed", stem + ".png")
+            event_path = os.path.join(sequence_dir, "event_voxel", stem + ".npz")
+            if os.path.exists(gt_path) and os.path.exists(event_path):
+                samples.append((blur_path, gt_path, event_path))
+            else:
+                incomplete.append(os.path.join(os.path.basename(sequence_dir), stem))
+
+        if incomplete:
+            raise RuntimeError(
+                f"Found {len(incomplete)} incomplete EVRB samples under {self.dataroot}; "
+                f"first missing sample: {incomplete[0]}"
+            )
+        if not samples:
+            raise RuntimeError(f"No complete EVRB samples found under {self.dataroot}")
+        return samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def _sample_rng(self, index):
+        if self.seed is None:
+            return None
+        return random.Random(self.seed + self.epoch * len(self.samples) + index)
+
+    def __getitem__(self, index):
+        blur_path, gt_path, event_path = self.samples[index]
+        blur = _to_chw_float_image(blur_path)
+        gt = _to_chw_float_image(gt_path)
+        if blur.shape != gt.shape:
+            raise ValueError(
+                f"EVRB blur/GT size mismatch: {tuple(blur.shape)} vs {tuple(gt.shape)} "
+                f"for {blur_path}"
+            )
+
+        event = _load_precomputed_voxel(event_path, self.event_bins)
+        if event.shape[-2:] != gt.shape[-2:]:
+            raise ValueError(
+                f"EVRB event/image size mismatch: {tuple(event.shape[-2:])} vs "
+                f"{tuple(gt.shape[-2:])} for {event_path}"
+            )
+        if self.norm_event:
+            event = _normalize_event(event)
+
+        blur, gt, event = _crop_triplet(
+            blur, gt, event, self.patch_size, self.random_crop, self._sample_rng(index)
+        )
+        return {"blur": blur, "gt": gt, "event": event}
+
+
 def build_dataset(opt_dataset):
     dataset_type = opt_dataset.get("dataset_type", "h5")
     if dataset_type == "h5":
@@ -385,6 +475,8 @@ def build_dataset(opt_dataset):
         return ImageEventDeblurDataset(opt_dataset)
     if dataset_type == "revd":
         return REVDEventDeblurDataset(opt_dataset)
+    if dataset_type == "evrb":
+        return EVRBEventDeblurDataset(opt_dataset)
     raise ValueError(f"Unknown dataset_type: {dataset_type}")
 
 

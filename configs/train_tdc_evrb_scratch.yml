@@ -1,0 +1,61 @@
+name: Seed42_BidirectionalEventThenRGB4CA_EncoderRestormerChannelSA_EVRB_5GPU_FromScratch_600ep
+
+model:
+  type: progressive_fusion
+  rgb_in: 3
+  event_in: 16
+  base_dim: 32
+  fusion_mode: bidirectional_event_then_rgb_ca
+  fusion_dim: 2d
+  cross_attn_type: channel
+  swapped_kv_order: event3d_first
+  encoder_self_attn: restormer_channel
+  self_attn_window_size: 8
+  cross_attn_window_size: 8
+  temporal_window_size: 2
+  num_heads: 4
+  qk_norm: false
+  gamma_init: 0.1
+  deform_alignment: none
+  decoder_block: plain
+  decoder_attention: none
+  two_stage: false
+  sam_mode: none
+  refine_type: shallow
+
+loss:
+  type: l1
+  edge_weight: 0.05
+
+datasets:
+  train:
+    dataset_type: evrb
+    dataroot: /data1/jzy/datasets/EVRB/train
+    event_bins: 16
+    batch_size: 1
+    num_workers: 4
+    prefetch_factor: 2
+    patch_size: 256
+    norm_event: true
+  val:
+    dataset_type: evrb
+    dataroot: /data1/jzy/datasets/EVRB/test
+    event_bins: 16
+    # Keep periodic validation comparable to earlier 256x256 training runs.
+    patch_size: 256
+    norm_event: true
+    num_workers: 0
+
+train:
+  num_epochs: 600
+  learning_rate: 0.0002
+  val_interval: 5
+  seed: 42
+  deterministic: true
+  stage1_loss_weight: 0.5
+  stage2_loss_weight: 1.0
+
+path:
+  experiments_root: /data1/jzy/experiments
+  pretrain_model: ~
+  resume_state: ~
