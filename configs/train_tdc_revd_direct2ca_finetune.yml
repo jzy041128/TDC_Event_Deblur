@@ -1,0 +1,62 @@
+name: Seed42_DirectEventToRGB2CA_EncoderRestormerChannelSA_REVD_Finetune_5GPU_200ep
+
+model:
+  type: progressive_fusion
+  base_dim: 32
+  fusion_mode: direct_event_to_rgb_2ca
+  fusion_dim: 2d
+  cross_attn_type: channel
+  swapped_kv_order: event3d_first
+  encoder_self_attn: restormer_channel
+  self_attn_window_size: 8
+  cross_attn_window_size: 8
+  temporal_window_size: 2
+  num_heads: 4
+  qk_norm: false
+  gamma_init: 0.1
+  deform_alignment: none
+  decoder_block: plain
+  decoder_attention: none
+  two_stage: false
+  sam_mode: none
+  refine_type: shallow
+
+loss:
+  type: l1
+  edge_weight: 0.05
+
+datasets:
+  train:
+    dataset_type: revd
+    dataroot: /data1/jzy/datasets/REVD/train
+    event_cache_root: /data1/jzy/datasets/REVD_voxel6_trilinear/train
+    event_bins: 6
+    event_voxel_mode: trilinear
+    batch_size: 1
+    num_workers: 4
+    prefetch_factor: 2
+    patch_size: 256
+    norm_event: true
+  val:
+    dataset_type: revd
+    dataroot: /data1/jzy/datasets/REVD/test
+    event_cache_root: /data1/jzy/datasets/REVD_voxel6_trilinear/test
+    event_bins: 6
+    event_voxel_mode: trilinear
+    patch_size: 256
+    norm_event: true
+    num_workers: 0
+
+train:
+  num_epochs: 200
+  learning_rate: 0.00002
+  val_interval: 5
+  seed: 42
+  deterministic: true
+  stage1_loss_weight: 0.5
+  stage2_loss_weight: 1.0
+
+path:
+  experiments_root: /data1/jzy/experiments
+  pretrain_model: /data1/jzy/experiments/Seed42_DirectEventToRGB2CA_EncoderRestormerChannelSA_2D_Plain_Server_5GPU_FromScratch_600ep_20260914_130935/best.pth
+  resume_state: ~
