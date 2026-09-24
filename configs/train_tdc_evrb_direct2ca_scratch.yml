@@ -1,4 +1,4 @@
-name: Seed42_DirectEventToRGB2CA_EncoderRestormerChannelSA_EVRB_5GPU_FromScratch_600ep
+name: Seed42_DirectEventToRGB2CA_EncoderRestormerChannelSA_EVRB_5GPU_FromScratch_400ep
 
 model:
   type: progressive_fusion
@@ -46,7 +46,7 @@ datasets:
     num_workers: 0
 
 train:
-  num_epochs: 600
+  num_epochs: 400
   learning_rate: 0.0002
   val_interval: 5
   seed: 42
