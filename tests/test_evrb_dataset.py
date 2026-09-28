@@ -66,6 +66,40 @@ class EVRBDatasetTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Expected a 16-bin CHW voxel"):
                 dataset[0]
 
+    def test_separate_six_bin_cache(self):
+        with tempfile.TemporaryDirectory() as root:
+            dataroot = Path(root) / "EVRB" / "train"
+            self._make_sample(dataroot)
+            cache_root = Path(root) / "EVRB_voxel6_matched" / "train"
+            cache_path = cache_root / "00000" / "event_voxel" / "00001.npz"
+            cache_path.parent.mkdir(parents=True)
+            np.savez(cache_path, data=np.full((6, 12, 18), 3.0, dtype=np.float32))
+
+            dataset = EVRBEventDeblurDataset(
+                {
+                    "dataroot": str(dataroot),
+                    "event_cache_root": str(cache_root),
+                    "patch_size": None,
+                    "event_bins": 6,
+                }
+            )
+            sample = dataset[0]
+            self.assertEqual(tuple(sample["event"].shape), (6, 12, 18))
+            self.assertTrue((sample["event"] == 3.0).all())
+
+    def test_missing_six_bin_cache_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            dataroot = Path(root) / "EVRB" / "train"
+            self._make_sample(dataroot)
+            with self.assertRaisesRegex(RuntimeError, "incomplete EVRB samples"):
+                EVRBEventDeblurDataset(
+                    {
+                        "dataroot": str(dataroot),
+                        "event_cache_root": str(Path(root) / "empty_cache"),
+                        "event_bins": 6,
+                    }
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

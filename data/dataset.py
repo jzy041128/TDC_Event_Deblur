@@ -396,6 +396,7 @@ class EVRBEventDeblurDataset(Dataset):
     def __init__(self, opt_dataset):
         super().__init__()
         self.dataroot = opt_dataset["dataroot"]
+        self.event_cache_root = opt_dataset.get("event_cache_root")
         self.patch_size = opt_dataset.get("patch_size", 256)
         self.random_crop = opt_dataset.get("random_crop", True)
         self.split = opt_dataset.get("split", "dataset")
@@ -404,7 +405,8 @@ class EVRBEventDeblurDataset(Dataset):
         self.seed = opt_dataset.get("seed")
         self.epoch = 0
         self.samples = self._build_samples()
-        print(f"Loaded {self.split}: {len(self.samples)} EVRB samples (official voxels).")
+        source = "cached voxels" if self.event_cache_root else "official voxels"
+        print(f"Loaded {self.split}: {len(self.samples)} EVRB samples ({source}).")
 
     def _build_samples(self):
         blur_paths = sorted(
@@ -416,7 +418,15 @@ class EVRBEventDeblurDataset(Dataset):
             sequence_dir = os.path.dirname(os.path.dirname(blur_path))
             stem = os.path.splitext(os.path.basename(blur_path))[0]
             gt_path = os.path.join(sequence_dir, "gt_processed", stem + ".png")
-            event_path = os.path.join(sequence_dir, "event_voxel", stem + ".npz")
+            if self.event_cache_root:
+                event_path = os.path.join(
+                    self.event_cache_root,
+                    os.path.basename(sequence_dir),
+                    "event_voxel",
+                    stem + ".npz",
+                )
+            else:
+                event_path = os.path.join(sequence_dir, "event_voxel", stem + ".npz")
             if os.path.exists(gt_path) and os.path.exists(event_path):
                 samples.append((blur_path, gt_path, event_path))
             else:
