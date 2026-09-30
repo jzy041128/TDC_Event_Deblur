@@ -260,6 +260,7 @@ def main():
         f"deform: {model_cfg.get('deform_alignment', 'none')} | "
         f"windows(self/cross/time): {model_cfg.get('self_attn_window_size', 8)}/"
         f"{model_cfg.get('cross_attn_window_size', 8)}/{model_cfg.get('temporal_window_size', 2)} | "
+        f"tdc_kernel: {model_cfg.get('tdc_kernel_size', 5)} | "
         f"num_heads: {model_cfg.get('num_heads', 4)} | "
         f"decoder: {model_cfg.get('decoder_block', 'plain')} | "
         f"decoder_sa: {model_cfg.get('decoder_attention', 'none')} | "

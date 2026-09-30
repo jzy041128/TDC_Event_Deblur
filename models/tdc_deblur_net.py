@@ -1191,6 +1191,7 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         self_attn_window_size=8,
         cross_attn_window_size=8,
         temporal_window_size=2,
+        tdc_kernel_size=5,
         num_heads=4,
         qk_norm=False,
         gamma_init=0.1,
@@ -1234,11 +1235,13 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         self.sam_mode = sam_mode
         self.rgb_stem = ConvBlock2D(rgb_in, dims[0])
         self.event2d_stem = ConvBlock2D(event_in, dims[0])
-        self.event3d_stem = ShortTermTDCBlock3D(1, dims[0])
+        self.event3d_stem = ShortTermTDCBlock3D(1, dims[0], kernel_size=tdc_kernel_size)
         self.rgb_down = nn.ModuleList([ConvBlock2D(dims[i], dims[i + 1], stride=2) for i in range(2)])
         self.event2d_down = nn.ModuleList([ConvBlock2D(dims[i], dims[i + 1], stride=2) for i in range(2)])
         self.event3d_down = nn.ModuleList([
-            ShortTermTDCBlock3D(dims[i], dims[i + 1], stride=(1, 2, 2)) for i in range(2)
+            ShortTermTDCBlock3D(
+                dims[i], dims[i + 1], stride=(1, 2, 2), kernel_size=tdc_kernel_size
+            ) for i in range(2)
         ])
         self.rgb_alignment = nn.ModuleList([
             ImageGuidedDeformAlignment2D(dim) if deform_alignment == "image_guided" else nn.Identity()

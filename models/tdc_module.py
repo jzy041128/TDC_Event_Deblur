@@ -6,14 +6,16 @@ import torch.nn.functional as F
 class ShortTermTDC3D(nn.Module):
     """BN-free short-term temporal difference convolution in kernel space."""
 
-    def __init__(self, in_channels, out_channels, stride=(1, 1, 1), groups=1):
+    def __init__(self, in_channels, out_channels, stride=(1, 1, 1), groups=1, kernel_size=5):
         super().__init__()
+        if kernel_size < 3 or kernel_size % 2 != 1:
+            raise ValueError("TDC temporal kernel_size must be an odd integer >= 3.")
         self.conv = nn.Conv3d(
             in_channels,
             out_channels,
-            kernel_size=(5, 3, 3),
+            kernel_size=(kernel_size, 3, 3),
             stride=stride,
-            padding=(2, 1, 1),
+            padding=(kernel_size // 2, 1, 1),
             groups=groups,
             bias=False,
         )
@@ -21,10 +23,8 @@ class ShortTermTDC3D(nn.Module):
     def short_term_weight(self):
         weight = self.conv.weight
         diff_weight = torch.zeros_like(weight)
-        diff_weight[:, :, 4] = weight[:, :, 4]
-        diff_weight[:, :, 3] = weight[:, :, 3] - weight[:, :, 4]
-        diff_weight[:, :, 2] = weight[:, :, 2] - weight[:, :, 3]
-        diff_weight[:, :, 1] = weight[:, :, 1] - weight[:, :, 2]
+        diff_weight[:, :, -1] = weight[:, :, -1]
+        diff_weight[:, :, 1:-1] = weight[:, :, 1:-1] - weight[:, :, 2:]
         diff_weight[:, :, 0] = -weight[:, :, 1]
         return diff_weight
 
@@ -40,9 +40,9 @@ class ShortTermTDC3D(nn.Module):
 
 
 class ShortTermTDCBlock3D(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=(1, 1, 1)):
+    def __init__(self, in_channels, out_channels, stride=(1, 1, 1), kernel_size=5):
         super().__init__()
-        self.tdc = ShortTermTDC3D(in_channels, out_channels, stride=stride)
+        self.tdc = ShortTermTDC3D(in_channels, out_channels, stride=stride, kernel_size=kernel_size)
         self.spatial = nn.Conv3d(
             out_channels,
             out_channels,
