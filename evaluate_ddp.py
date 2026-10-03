@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import time
 
@@ -11,7 +12,7 @@ from skimage.metrics import structural_similarity as calculate_ssim
 from torch.utils.data import DataLoader, Sampler, Subset
 
 from data.dataset import build_dataset
-from models.tdc_deblur_net import build_deblur_model
+from models.tdc_deblur_net import EventThenRGBFourCrossAttention2D, build_deblur_model
 from utils.reproducibility import set_global_seed
 
 
@@ -33,6 +34,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate a trained checkpoint without training.")
     parser.add_argument("--config", required=True, help="Config containing the model and val dataset.")
     parser.add_argument("--checkpoint", required=True, help="Checkpoint containing model_state_dict.")
+    parser.add_argument(
+        "--event-exchange-scale",
+        type=float,
+        default=None,
+        help="Scale both event-event residuals at every bidirectional 4CA stage. "
+        "Use 1, 0.5, or 0 for diagnosis; omitted leaves checkpoint weights unchanged.",
+    )
     parser.add_argument(
         "--full-resolution",
         action="store_true",
@@ -63,6 +71,32 @@ def parse_args():
         help="Print progress every N samples processed by rank 0; 0 disables it.",
     )
     return parser.parse_args()
+
+
+def scale_event_exchange(model, scale):
+    """Apply an inference-only intervention after loading the original checkpoint."""
+    if not math.isfinite(scale) or scale < 0:
+        raise ValueError("--event-exchange-scale must be finite and nonnegative.")
+    stages = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, EventThenRGBFourCrossAttention2D)
+        and getattr(module, "cross_event", False)
+    ]
+    if not stages:
+        raise ValueError("--event-exchange-scale requires bidirectional event-event 4CA stages.")
+
+    changes = []
+    with torch.no_grad():
+        for name, module in stages:
+            before_e2 = module.gamma_e2.item()
+            before_e3 = module.gamma_e3.item()
+            module.gamma_e2.mul_(scale)
+            module.gamma_e3.mul_(scale)
+            changes.append(
+                (name, before_e2, module.gamma_e2.item(), before_e3, module.gamma_e3.item())
+            )
+    return changes
 
 
 def setup_runtime():
@@ -175,6 +209,10 @@ def main():
     args = parse_args()
     if args.log_interval < 0:
         raise ValueError("--log-interval must be at least 0.")
+    if args.event_exchange_scale is not None and (
+        not math.isfinite(args.event_exchange_scale) or args.event_exchange_scale < 0
+    ):
+        raise ValueError("--event-exchange-scale must be finite and nonnegative.")
     if args.tile_size is not None:
         if args.tile_size < 1:
             raise ValueError("--tile-size must be at least 1.")
@@ -222,6 +260,11 @@ def main():
     if "model_state_dict" not in checkpoint:
         raise KeyError(f"Checkpoint has no model_state_dict: {args.checkpoint}")
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    exchange_changes = (
+        scale_event_exchange(model, args.event_exchange_scale)
+        if args.event_exchange_scale is not None
+        else []
+    )
     model.eval()
 
     if device.type == "cuda":
@@ -231,6 +274,16 @@ def main():
         first = dataset[0]
         print(f"Config: {args.config}")
         print(f"Checkpoint: {args.checkpoint}")
+        if exchange_changes:
+            print(
+                f"Event exchange scale: {args.event_exchange_scale:g} | "
+                f"stages: {len(exchange_changes)} | in-memory only; checkpoint file unchanged"
+            )
+            for name, before_e2, after_e2, before_e3, after_e3 in exchange_changes:
+                print(
+                    f"  {name}: E3->E2 gamma {before_e2:.8g} -> {after_e2:.8g} | "
+                    f"E2->E3 gamma {before_e3:.8g} -> {after_e3:.8g}"
+                )
         print(f"Evaluation samples: {len(dataset)} | world_size: {world_size}")
         print(f"Full resolution: {args.full_resolution}")
         print(
