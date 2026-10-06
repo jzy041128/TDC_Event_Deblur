@@ -127,25 +127,30 @@ class RGBGated4CATests(unittest.TestCase):
         self.assertEqual(files, {
             "train_tdc_evrb_rgb_gated4ca_scratch.yml",
             "eval_tdc_evrb_rgb_gated4ca_full.yml",
+            "train_tdc_evrb_6bin_rgb_gated4ca_scratch.yml",
+            "eval_tdc_evrb_6bin_rgb_gated4ca_full.yml",
         })
-        config = yaml.safe_load((ROOT / "configs/train_tdc_evrb_rgb_gated4ca_scratch.yml").read_text())
-        baseline = yaml.safe_load((ROOT / "configs/train_tdc_evrb_scratch.yml").read_text(encoding="utf-8"))
-        evaluation = yaml.safe_load((ROOT / "configs/eval_tdc_evrb_rgb_gated4ca_full.yml").read_text())
-        self.assertEqual(config["model"]["fusion_mode"], GATED_MODE)
-        self.assertEqual(config["model"]["tdc_kernel_size"], 5)
-        self.assertEqual(config["train"]["num_epochs"], 400)
-        self.assertIsNone(config["path"]["pretrain_model"])
-        self.assertIsNone(config["path"]["resume_state"])
-        self.assertEqual(evaluation["model"], config["model"])
-        expected_val = copy.deepcopy(config["datasets"]["val"])
-        expected_val["patch_size"] = None
-        self.assertEqual(evaluation["datasets"]["val"], expected_val)
-        trial = copy.deepcopy(config)
-        trial["name"] = baseline["name"]
-        trial["model"]["fusion_mode"] = baseline["model"]["fusion_mode"]
-        trial["model"].pop("tdc_kernel_size")
-        trial["train"]["num_epochs"] = baseline["train"]["num_epochs"]
-        self.assertEqual(trial, baseline)
+        for suffix, bins in (("", 16), ("_6bin", 6)):
+            with self.subTest(bins=bins):
+                config = yaml.safe_load((ROOT / f"configs/train_tdc_evrb{suffix}_rgb_gated4ca_scratch.yml").read_text())
+                baseline = yaml.safe_load((ROOT / f"configs/train_tdc_evrb{suffix}_scratch.yml").read_text(encoding="utf-8"))
+                evaluation = yaml.safe_load((ROOT / f"configs/eval_tdc_evrb{suffix}_rgb_gated4ca_full.yml").read_text())
+                self.assertEqual(config["model"]["fusion_mode"], GATED_MODE)
+                self.assertEqual(config["model"]["tdc_kernel_size"], 5)
+                self.assertEqual(config["model"]["event_in"], bins)
+                self.assertEqual(config["train"]["num_epochs"], 400)
+                self.assertIsNone(config["path"]["pretrain_model"])
+                self.assertIsNone(config["path"]["resume_state"])
+                self.assertEqual(evaluation["model"], config["model"])
+                expected_val = copy.deepcopy(config["datasets"]["val"])
+                expected_val["patch_size"] = None
+                self.assertEqual(evaluation["datasets"]["val"], expected_val)
+                trial = copy.deepcopy(config)
+                trial["name"] = baseline["name"]
+                trial["model"]["fusion_mode"] = baseline["model"]["fusion_mode"]
+                trial["model"].pop("tdc_kernel_size")
+                trial["train"]["num_epochs"] = baseline["train"]["num_epochs"]
+                self.assertEqual(trial, baseline)
 
 
 if __name__ == "__main__":

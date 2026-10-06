@@ -1,0 +1,36 @@
+name: RGBGatedEventThenRGB4CA_EVRB_6bin_FullResolution_Eval
+model:
+  type: progressive_fusion
+  rgb_in: 3
+  event_in: 6
+  base_dim: 32
+  fusion_mode: rgb_gated_event_then_rgb_4ca
+  fusion_dim: 2d
+  cross_attn_type: channel
+  swapped_kv_order: event3d_first
+  encoder_self_attn: restormer_channel
+  self_attn_window_size: 8
+  cross_attn_window_size: 8
+  temporal_window_size: 2
+  tdc_kernel_size: 5
+  num_heads: 4
+  qk_norm: false
+  gamma_init: 0.1
+  deform_alignment: none
+  decoder_block: plain
+  decoder_attention: none
+  two_stage: false
+  sam_mode: none
+  refine_type: shallow
+datasets:
+  val:
+    dataset_type: evrb
+    dataroot: /data1/jzy/datasets/EVRB/test
+    event_bins: 6
+    patch_size: null
+    norm_event: true
+    num_workers: 0
+    event_cache_root: /data1/jzy/datasets/EVRB_voxel6_matched/test
+train:
+  seed: 42
+  deterministic: true

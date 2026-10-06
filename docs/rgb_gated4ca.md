@@ -34,11 +34,18 @@ At base_dim=32, the gates add 17,646 parameters, approximately 0.5% of the netwo
 
 ## Configurations
 
-Only the first EVRB experiment is configured:
+Only EVRB gate experiments are configured:
 
 - `train_tdc_evrb_rgb_gated4ca_scratch.yml`: official 16-bin, TDC kernel size 5,
   400 epochs from scratch, seed 42, validation every 5 epochs.
 - `eval_tdc_evrb_rgb_gated4ca_full.yml`: matching full-image evaluation model.
+- `train_tdc_evrb_6bin_rgb_gated4ca_scratch.yml`: matched 6-bin cache, TDC kernel
+  size 5, 400 epochs from scratch, otherwise matching the original 6-bin four-CA run.
+- `eval_tdc_evrb_6bin_rgb_gated4ca_full.yml`: matching 6-bin full-image evaluation.
+
+Run the 6-bin experiment first for the lower-cost gate comparison. Its event
+cache roots are `/data1/jzy/datasets/EVRB_voxel6_matched/train` and `test`;
+RGB/GT are still read from the original EVRB train/test directories.
 
 The model supports 6/16 bins and TDC kernel sizes 5/7. Dataset support for GoPro,
 REVD and REBlur is retained. Add their gate configurations after assessing EVRB.
@@ -54,12 +61,12 @@ four-CA checkpoint is rejected when loading a gated model.
 After the current 7-kernel two-CA run and its full-image evaluation finish:
 
 ```bash
-tmux new -s evrb_rgb_gate4ca
+tmux new -s evrb6_rgb_gate4ca
 conda activate tdc_deblur
 cd ~/projects/TDC_Event_Deblur
 CUDA_VISIBLE_DEVICES=0,2,3,4,5 \
 torchrun --standalone --nproc_per_node=5 train_ddp.py \
-  --config configs/train_tdc_evrb_rgb_gated4ca_scratch.yml
+  --config configs/train_tdc_evrb_6bin_rgb_gated4ca_scratch.yml
 ```
 
 Save the training and evaluation YAMLs into the new experiment directory.
