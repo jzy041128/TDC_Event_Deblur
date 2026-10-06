@@ -971,6 +971,60 @@ class EventThenRGBFourCrossAttention2D(nn.Module):
         )
 
 
+class RGBGuidedEventExchangeGate2D(nn.Module):
+    """Predict independent spatial gains for the two event exchange residuals."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.norm_rgb = ChannelLayerNorm2D(channels)
+        self.norm_e2 = ChannelLayerNorm2D(channels)
+        self.norm_e3 = ChannelLayerNorm2D(channels)
+        hidden_channels = max(channels // 4, 1)
+        # Gate initialization must not shift the shared backbone's RNG sequence.
+        with torch.random.fork_rng(devices=[]):
+            self.reduce = nn.Conv2d(channels * 3, hidden_channels, 1)
+            self.to_logits = nn.Conv2d(hidden_channels, 2, 1)
+        self.activation = nn.GELU()
+        self.reset_identity()
+
+    def reset_identity(self):
+        nn.init.zeros_(self.to_logits.weight)
+        nn.init.zeros_(self.to_logits.bias)
+
+    def forward(self, rgb, event2d, event3d):
+        inputs = torch.cat(
+            [self.norm_rgb(rgb), self.norm_e2(event2d), self.norm_e3(event3d)],
+            dim=1,
+        )
+        gains = 2.0 * torch.sigmoid(self.to_logits(self.activation(self.reduce(inputs))))
+        return gains[:, :1], gains[:, 1:]
+
+
+class RGBGatedEventThenRGBFourCrossAttention2D(EventThenRGBFourCrossAttention2D):
+    """Keep four CAs and gate only the projected event-to-event residuals."""
+
+    def __init__(
+        self, channels, attention_type, window_size, num_heads, qk_norm, gamma_init
+    ):
+        super().__init__(
+            channels, attention_type, window_size, num_heads, qk_norm, gamma_init,
+            cross_event=True,
+        )
+        self.exchange_gate = RGBGuidedEventExchangeGate2D(channels)
+
+    def forward(self, rgb, event2d, event3d):
+        if rgb.shape != event2d.shape or rgb.shape != event3d.shape:
+            raise ValueError(
+                "RGB, Event2D, and mean Event3D features must have the same shape"
+            )
+        gate_e2, gate_e3 = self.exchange_gate(rgb, event2d, event3d)
+        delta_e2 = self.e2_from_e3(event2d, event3d, event3d)
+        delta_e3 = self.e3_from_e2(event3d, event2d, event2d)
+        event2d_enhanced = event2d + self.gamma_e2 * gate_e2 * self.inject_e2(delta_e2)
+        event3d_enhanced = event3d + self.gamma_e3 * gate_e3 * self.inject_e3(delta_e3)
+        return self.fuse_rgb(rgb, event2d_enhanced, event3d_enhanced)
+
+
 class DirectEventToRGBCrossAttention2D(EventThenRGBFourCrossAttention2D):
     """Ablate event-event enhancement while preserving the RGB fusion path."""
 
@@ -1031,6 +1085,7 @@ class ThreeBranchStageFusion(nn.Module):
         "swapped_kv_cascaded_ca",
         "parallel_swapped_kv_cat_ca",
         "bidirectional_event_then_rgb_ca",
+        "rgb_gated_event_then_rgb_4ca",
         "independent_event_then_rgb_4ca",
         "direct_event_to_rgb_2ca",
     }
@@ -1038,6 +1093,7 @@ class ThreeBranchStageFusion(nn.Module):
     SOFT_ROUTED_DUAL_MODES = {"soft_routed_dual_ca"}
     FOUR_CA_MODES = {
         "bidirectional_event_then_rgb_ca",
+        "rgb_gated_event_then_rgb_4ca",
         "independent_event_then_rgb_4ca",
     }
     DIRECT_EVENT_RGB_MODES = {"direct_event_to_rgb_2ca"}
@@ -1087,6 +1143,15 @@ class ThreeBranchStageFusion(nn.Module):
             )
             self.inject1 = nn.Conv2d(channels, channels, 3, padding=1)
             self.inject2 = nn.Conv2d(channels, channels, 3, padding=1)
+        elif self.fusion_mode == "rgb_gated_event_then_rgb_4ca":
+            self.bidirectional_event_rgb = RGBGatedEventThenRGBFourCrossAttention2D(
+                channels,
+                self.cross_attn_type,
+                cross_window_size,
+                num_heads,
+                qk_norm,
+                gamma_init,
+            )
         elif self.fusion_mode in self.FOUR_CA_MODES:
             self.bidirectional_event_rgb = EventThenRGBFourCrossAttention2D(
                 channels,
