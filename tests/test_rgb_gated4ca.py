@@ -131,6 +131,8 @@ class RGBGated4CATests(unittest.TestCase):
             "eval_tdc_evrb_6bin_rgb_gated4ca_full.yml",
             "train_tdc_reblur_rgb_gated4ca_scratch.yml",
             "train_tdc_reblur_rgb_gated4ca_conv3d_scratch.yml",
+            "train_tdc_gopro_rgb_gated4ca_scratch.yml",
+            "train_tdc_gopro_rgb_gated4ca_conv3d_scratch.yml",
         })
         for suffix, bins in (("", 16), ("_6bin", 6)):
             with self.subTest(bins=bins):

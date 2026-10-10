@@ -113,6 +113,39 @@ class Event3DConvTypeTests(unittest.TestCase):
         with torch.no_grad():
             self.assertTrue(torch.equal(model(*inputs), clone(*inputs)))
 
+    def test_gopro_configs_match_baseline_and_change_only_convolution(self):
+        def load(name):
+            return yaml.safe_load((ROOT / "configs" / name).read_text(encoding="utf-8"))
+
+        baseline = load("train_tdc_gopro_direct2ca_scratch.yml")
+        gated = load("train_tdc_gopro_rgb_gated4ca_scratch.yml")
+        plain = load("train_tdc_gopro_rgb_gated4ca_conv3d_scratch.yml")
+        for config, conv_type in ((gated, "tdc"), (plain, "conv3d")):
+            self.assertEqual(config["model"]["fusion_mode"], GATED_MODE)
+            self.assertEqual(config["model"]["event3d_conv_type"], conv_type)
+            self.assertEqual(config["model"]["tdc_kernel_size"], 5)
+            self.assertEqual(config["model"]["event_in"], 6)
+            self.assertEqual(config["train"]["num_epochs"], 600)
+            self.assertEqual(config["train"]["val_interval"], 1)
+            self.assertIsNone(config["path"]["pretrain_model"])
+            self.assertIsNone(config["path"]["resume_state"])
+            self.assertEqual(config["datasets"], baseline["datasets"])
+            trial = copy.deepcopy(config)
+            trial["name"] = baseline["name"]
+            trial["model"]["fusion_mode"] = baseline["model"]["fusion_mode"]
+            for key in ("event_in", "tdc_kernel_size", "event3d_conv_type"):
+                trial["model"].pop(key)
+            self.assertEqual(trial, baseline)
+
+            model = build_deblur_model(**config["model"])
+            for block in (model.event3d_stem, *model.event3d_down):
+                self.assertEqual(block.tdc.conv_type, conv_type)
+                self.assertEqual(block.tdc.conv.kernel_size, (5, 3, 3))
+
+        plain["name"] = gated["name"]
+        plain["model"]["event3d_conv_type"] = "tdc"
+        self.assertEqual(plain, gated)
+
     def test_reblur_configs_change_only_fusion_or_convolution(self):
         def load(name):
             return yaml.safe_load((ROOT / "configs" / name).read_text(encoding="utf-8"))

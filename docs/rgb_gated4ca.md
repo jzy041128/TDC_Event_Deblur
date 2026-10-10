@@ -49,8 +49,17 @@ RGB/GT are still read from the original EVRB train/test directories.
 
 The model supports 6/16 bins and TDC kernel sizes 5/7. REBlur now also has
 200-epoch scratch gate and plain-Conv3d comparisons; see `reblur_scratch_ablation.md`.
-Dataset support for GoPro and REVD is retained. Their gate configurations are
-not provided yet.
+GoPro scratch gate experiments use the existing 6-bin server voxels, 600 epochs,
+learning rate 0.0002, seed 42 and validation every epoch on 256-pixel crops:
+
+- `train_tdc_gopro_rgb_gated4ca_scratch.yml`: TDC temporal kernel size 5.
+- `train_tdc_gopro_rgb_gated4ca_conv3d_scratch.yml`: raw Conv3d kernel size 5,
+  otherwise identical to the TDC configuration.
+
+Both start with null pretrain_model and resume_state. Optional final full-image
+evaluation can use the matching training YAML with --full-resolution,
+--tile-size 256 and --tile-overlap 32. Keep the checkpoint's convolution type.
+Dataset support for REVD is retained; its gate configurations are not provided yet.
 
 The planned transfer protocol trains the gated four-CA model on GoPro first,
 then fine-tunes its complete checkpoint on REBlur and REVD. Training preloads,
