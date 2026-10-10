@@ -6,8 +6,12 @@ import torch.nn.functional as F
 class ShortTermTDC3D(nn.Module):
     """BN-free short-term temporal difference convolution in kernel space."""
 
-    def __init__(self, in_channels, out_channels, stride=(1, 1, 1), groups=1, kernel_size=5):
+    def __init__(self, in_channels, out_channels, stride=(1, 1, 1), groups=1, kernel_size=5, conv_type="tdc"):
         super().__init__()
+        conv_type = conv_type.lower()
+        if conv_type not in {"tdc", "conv3d"}:
+            raise ValueError(f"Unknown event3d_conv_type: {conv_type}")
+        self.conv_type = conv_type
         if kernel_size < 3 or kernel_size % 2 != 1:
             raise ValueError("TDC temporal kernel_size must be an odd integer >= 3.")
         self.conv = nn.Conv3d(
@@ -29,6 +33,8 @@ class ShortTermTDC3D(nn.Module):
         return diff_weight
 
     def forward(self, x):
+        if self.conv_type == "conv3d":
+            return self.conv(x)
         return F.conv3d(
             x,
             self.short_term_weight(),
@@ -40,9 +46,11 @@ class ShortTermTDC3D(nn.Module):
 
 
 class ShortTermTDCBlock3D(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=(1, 1, 1), kernel_size=5):
+    def __init__(self, in_channels, out_channels, stride=(1, 1, 1), kernel_size=5, conv_type="tdc"):
         super().__init__()
-        self.tdc = ShortTermTDC3D(in_channels, out_channels, stride=stride, kernel_size=kernel_size)
+        self.tdc = ShortTermTDC3D(
+            in_channels, out_channels, stride=stride, kernel_size=kernel_size, conv_type=conv_type
+        )
         self.spatial = nn.Conv3d(
             out_channels,
             out_channels,

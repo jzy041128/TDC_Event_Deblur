@@ -259,6 +259,7 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if "model_state_dict" not in checkpoint:
         raise KeyError(f"Checkpoint has no model_state_dict: {args.checkpoint}")
+    model.validate_event3d_checkpoint(checkpoint)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     exchange_changes = (
         scale_event_exchange(model, args.event_exchange_scale)
@@ -274,6 +275,7 @@ def main():
         first = dataset[0]
         print(f"Config: {args.config}")
         print(f"Checkpoint: {args.checkpoint}")
+        print(f"Event3D convolution: {model.event3d_conv_type}")
         if exchange_changes:
             print(
                 f"Event exchange scale: {args.event_exchange_scale:g} | "

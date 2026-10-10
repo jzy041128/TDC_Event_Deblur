@@ -34,7 +34,7 @@ At base_dim=32, the gates add 17,646 parameters, approximately 0.5% of the netwo
 
 ## Configurations
 
-Only EVRB gate experiments are configured:
+EVRB gate experiments:
 
 - `train_tdc_evrb_rgb_gated4ca_scratch.yml`: official 16-bin, TDC kernel size 5,
   400 epochs from scratch, seed 42, validation every 5 epochs.
@@ -47,8 +47,10 @@ Run the 6-bin experiment first for the lower-cost gate comparison. Its event
 cache roots are `/data1/jzy/datasets/EVRB_voxel6_matched/train` and `test`;
 RGB/GT are still read from the original EVRB train/test directories.
 
-The model supports 6/16 bins and TDC kernel sizes 5/7. Dataset support for GoPro,
-REVD and REBlur is retained. Add their gate configurations after assessing EVRB.
+The model supports 6/16 bins and TDC kernel sizes 5/7. REBlur now also has
+200-epoch scratch gate and plain-Conv3d comparisons; see `reblur_scratch_ablation.md`.
+Dataset support for GoPro and REVD is retained. Their gate configurations are
+not provided yet.
 
 The planned transfer protocol trains the gated four-CA model on GoPro first,
 then fine-tunes its complete checkpoint on REBlur and REVD. Training preloads,

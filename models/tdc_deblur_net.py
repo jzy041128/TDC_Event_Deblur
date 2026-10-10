@@ -1266,8 +1266,13 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         two_stage=False,
         sam_mode="none",
         refine_type="shallow",
+        event3d_conv_type="tdc",
     ):
         super().__init__()
+        event3d_conv_type = event3d_conv_type.lower()
+        if event3d_conv_type not in {"tdc", "conv3d"}:
+            raise ValueError(f"Unknown event3d_conv_type: {event3d_conv_type}")
+        self.event3d_conv_type = event3d_conv_type
         encoder_self_attn = encoder_self_attn.lower()
         deform_alignment = deform_alignment.lower()
         decoder_block = decoder_block.lower()
@@ -1300,12 +1305,15 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         self.sam_mode = sam_mode
         self.rgb_stem = ConvBlock2D(rgb_in, dims[0])
         self.event2d_stem = ConvBlock2D(event_in, dims[0])
-        self.event3d_stem = ShortTermTDCBlock3D(1, dims[0], kernel_size=tdc_kernel_size)
+        self.event3d_stem = ShortTermTDCBlock3D(
+            1, dims[0], kernel_size=tdc_kernel_size, conv_type=event3d_conv_type
+        )
         self.rgb_down = nn.ModuleList([ConvBlock2D(dims[i], dims[i + 1], stride=2) for i in range(2)])
         self.event2d_down = nn.ModuleList([ConvBlock2D(dims[i], dims[i + 1], stride=2) for i in range(2)])
         self.event3d_down = nn.ModuleList([
             ShortTermTDCBlock3D(
-                dims[i], dims[i + 1], stride=(1, 2, 2), kernel_size=tdc_kernel_size
+                dims[i], dims[i + 1], stride=(1, 2, 2), kernel_size=tdc_kernel_size,
+                conv_type=event3d_conv_type,
             ) for i in range(2)
         ])
         self.rgb_alignment = nn.ModuleList([
@@ -1425,6 +1433,16 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
                 self.sam = SupervisedAttentionModule(dims[0], rgb_in, dims[0])
             refine_net = ShallowRefineNet if refine_type == "shallow" else LightUNetRefineNet
             self.refine = refine_net(dims[0], rgb_in)
+
+    def validate_event3d_checkpoint(self, checkpoint):
+        # Legacy checkpoints predate the switch and always used TDC.
+        saved_type = checkpoint.get("event3d_conv_type", "tdc")
+        if saved_type != self.event3d_conv_type:
+            raise ValueError(
+                f"Checkpoint event3d_conv_type={saved_type!r} does not match "
+                f"model event3d_conv_type={self.event3d_conv_type!r}. "
+                "Use the matching configuration; train convolution ablations separately."
+            )
 
     def attend(self, scale, rgb, event2d, event3d):
         rgb = self.rgb_alignment[scale](rgb)

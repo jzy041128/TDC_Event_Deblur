@@ -167,6 +167,7 @@ def main():
         f"cross_attn_type: {model_cfg.get('cross_attn_type', 'channel')} | "
         f"swapped_kv_order: {model_cfg.get('swapped_kv_order', 'event3d_first')} | "
         f"encoder_sa: {model_cfg.get('encoder_self_attn', 'restormer_channel')} | "
+        f"event3d_conv: {model.event3d_conv_type} | "
         f"deform: {model_cfg.get('deform_alignment', 'none')} | "
         f"windows(self/cross/time): {model_cfg.get('self_attn_window_size', 8)}/"
         f"{model_cfg.get('cross_attn_window_size', 8)}/{model_cfg.get('temporal_window_size', 2)} | "
@@ -193,6 +194,7 @@ def main():
         checkpoint = torch.load(pretrain_path, map_location=device, weights_only=False)
         if 'model_state_dict' not in checkpoint:
             raise KeyError(f'Checkpoint has no model_state_dict: {pretrain_path}')
+        model.validate_event3d_checkpoint(checkpoint)
         model.load_state_dict(checkpoint['model_state_dict'], strict=True)
         print(f'Loaded pretrained model weights: {pretrain_path}')
         print('Optimizer is new; training starts from epoch 0 in a new experiment directory.')
@@ -200,6 +202,7 @@ def main():
         if os.path.exists(resume_path):
             print(f"🔄 发现存档文件！正在从 {resume_path} 恢复训练...")
             checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+            model.validate_event3d_checkpoint(checkpoint)
             model.load_state_dict(checkpoint['model_state_dict'], strict=True)
             try:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -313,6 +316,7 @@ def main():
         save_dict = {
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
+            'event3d_conv_type': model.event3d_conv_type,
             'optimizer_state_dict': optimizer.state_dict(),
             'best_psnr': best_psnr,
             'rng_state': capture_rng_state(),

@@ -261,6 +261,7 @@ def main():
         f"windows(self/cross/time): {model_cfg.get('self_attn_window_size', 8)}/"
         f"{model_cfg.get('cross_attn_window_size', 8)}/{model_cfg.get('temporal_window_size', 2)} | "
         f"tdc_kernel: {model_cfg.get('tdc_kernel_size', 5)} | "
+        f"event3d_conv: {unwrap_model(model).event3d_conv_type} | "
         f"num_heads: {model_cfg.get('num_heads', 4)} | "
         f"decoder: {model_cfg.get('decoder_block', 'plain')} | "
         f"decoder_sa: {model_cfg.get('decoder_attention', 'none')} | "
@@ -283,6 +284,7 @@ def main():
         checkpoint = torch.load(pretrain_path, map_location=device, weights_only=False)
         if "model_state_dict" not in checkpoint:
             raise KeyError(f"Checkpoint has no model_state_dict: {pretrain_path}")
+        unwrap_model(model).validate_event3d_checkpoint(checkpoint)
         unwrap_model(model).load_state_dict(checkpoint["model_state_dict"], strict=True)
         if rank0():
             print(f"Loaded pretrained model weights: {pretrain_path}")
@@ -290,6 +292,7 @@ def main():
     elif configured_path(resume_path):
         if os.path.exists(resume_path):
             checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
+            unwrap_model(model).validate_event3d_checkpoint(checkpoint)
             unwrap_model(model).load_state_dict(checkpoint["model_state_dict"], strict=True)
             try:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -386,6 +389,7 @@ def main():
             save_dict = {
                 "epoch": epoch + 1,
                 "model_state_dict": unwrap_model(model).state_dict(),
+                "event3d_conv_type": unwrap_model(model).event3d_conv_type,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "best_psnr": best_psnr,
                 "rng_states": rng_states,
