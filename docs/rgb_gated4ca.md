@@ -59,7 +59,19 @@ learning rate 0.0002, seed 42 and validation every epoch on 256-pixel crops:
 Both start with null pretrain_model and resume_state. Optional final full-image
 evaluation can use the matching training YAML with --full-resolution,
 --tile-size 256 and --tile-overlap 32. Keep the checkpoint's convolution type.
-Dataset support for REVD is retained; its gate configurations are not provided yet.
+Gated transfer configurations now load the completed GoPro TDC gate best.pth
+from the experiment ending in `20261011_094822`:
+
+- `train_tdc_revd_rgb_gated4ca_finetune.yml`: 200 epochs, learning rate 0.00002,
+  validation every five epochs, existing 6-bin trilinear cache and 256-pixel crops.
+- `eval_tdc_revd_rgb_gated4ca_full.yml`: matching model and complete REVD images;
+  use tile-size 256 and tile-overlap 32, with no max-samples limit.
+- `train_tdc_reblur_rgb_gated4ca_finetune.yml`: the same fine-tuning schedule,
+  REBlur H5 input and complete-image validation.
+
+Both datasets independently initialize from the same gated GoPro checkpoint;
+REBlur does not preload the REVD fine-tuned checkpoint. Keep resume_state null
+for the initial fine-tuning run. Existing ungated and scratch configs are unchanged.
 
 The planned transfer protocol trains the gated four-CA model on GoPro first,
 then fine-tunes its complete checkpoint on REBlur and REVD. Training preloads,

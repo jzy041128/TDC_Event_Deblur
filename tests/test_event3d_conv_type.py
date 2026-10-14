@@ -146,6 +146,43 @@ class Event3DConvTypeTests(unittest.TestCase):
         plain["model"]["event3d_conv_type"] = "tdc"
         self.assertEqual(plain, gated)
 
+    def test_transfer_configs_use_complete_gated_gopro_model_and_match_baselines(self):
+        def load(name):
+            return yaml.safe_load((ROOT / "configs" / name).read_text(encoding="utf-8"))
+
+        gopro = load("train_tdc_gopro_rgb_gated4ca_scratch.yml")
+        source = (
+            "/data1/jzy/experiments/"
+            "Seed42_RGBGatedEventThenRGB4CA_EncoderRestormerChannelSA_GoPro_"
+            "5GPU_FromScratch_600ep_20261011_094822/best.pth"
+        )
+        for dataset in ("revd", "reblur"):
+            with self.subTest(dataset=dataset):
+                baseline = load(f"train_tdc_{dataset}_finetune.yml")
+                gated = load(f"train_tdc_{dataset}_rgb_gated4ca_finetune.yml")
+                self.assertEqual(gated["model"], gopro["model"])
+                self.assertEqual(gated["path"]["pretrain_model"], source)
+                self.assertIsNone(gated["path"]["resume_state"])
+                self.assertEqual(gated["train"]["num_epochs"], 200)
+                self.assertEqual(gated["train"]["learning_rate"], 0.00002)
+                self.assertEqual(gated["train"]["val_interval"], 5)
+                self.assertEqual(gated["datasets"], baseline["datasets"])
+                trial = copy.deepcopy(gated)
+                trial["name"] = baseline["name"]
+                trial["path"]["pretrain_model"] = baseline["path"]["pretrain_model"]
+                trial["model"]["fusion_mode"] = baseline["model"]["fusion_mode"]
+                for key in ("event_in", "tdc_kernel_size", "event3d_conv_type"):
+                    trial["model"].pop(key)
+                self.assertEqual(trial, baseline)
+
+        revd = load("train_tdc_revd_rgb_gated4ca_finetune.yml")
+        evaluation = load("eval_tdc_revd_rgb_gated4ca_full.yml")
+        self.assertEqual(evaluation["model"], revd["model"])
+        expected_val = copy.deepcopy(revd["datasets"]["val"])
+        expected_val["patch_size"] = None
+        self.assertEqual(evaluation["datasets"], {"val": expected_val})
+        self.assertEqual(evaluation["train"], {"seed": 42, "deterministic": True})
+
     def test_reblur_configs_change_only_fusion_or_convolution(self):
         def load(name):
             return yaml.safe_load((ROOT / "configs" / name).read_text(encoding="utf-8"))
