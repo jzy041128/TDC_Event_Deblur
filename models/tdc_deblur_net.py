@@ -745,6 +745,32 @@ class WindowCrossAttention2D(nn.Module):
         return self.proj(out)
 
 
+class ShiftedWindowCrossAttentionPair2D(nn.Module):
+    """Return an exchange residual using fixed then shifted spatial windows."""
+
+    def __init__(self, channels, window_size, num_heads, qk_norm=False):
+        super().__init__()
+        self.fixed = WindowCrossAttention2D(channels, window_size, num_heads, qk_norm)
+        self.shifted = WindowCrossAttention2D(
+            channels, window_size, num_heads, qk_norm, shift_size=window_size // 2
+        )
+
+    def forward(self, query, key, value):
+        if query.shape != key.shape or query.shape != value.shape:
+            raise ValueError("query, key, and value must have the same shape")
+        height, width = query.shape[-2:]
+        window = self.fixed.window_size
+        pad_h, pad_w = (-height) % window, (-width) % window
+        if pad_h or pad_w:
+            # Pad before cyclic shifts so the mask uses the same spatial grid.
+            query, key, value = [F.pad(x, (0, pad_w, 0, pad_h)) for x in (query, key, value)]
+        first_delta = self.fixed(query, key, value)
+        # Update only Q; K/V retain the source modality in both attention blocks.
+        second_delta = self.shifted(query + first_delta, key, value)
+        # The caller applies the original query residual, gate and gamma once.
+        return (first_delta + second_delta)[:, :, :height, :width]
+
+
 class EventImageChannelCrossAttention2D(nn.Module):
     def __init__(self, channels, num_heads):
         super().__init__()
@@ -893,6 +919,10 @@ def make_cross_attention_2d(
     attention_type = attention_type.lower()
     if attention_type == "channel":
         return EventImageChannelCrossAttention2D(channels, num_heads)
+    if attention_type == "shifted_window_pair":
+        return ShiftedWindowCrossAttentionPair2D(
+            channels, window_size, num_heads, qk_norm=qk_norm
+        )
     if attention_type in {"window", "shifted_window"}:
         shift_size = window_size // 2 if attention_type == "shifted_window" else 0
         return WindowCrossAttention2D(
@@ -1121,7 +1151,7 @@ class ThreeBranchStageFusion(nn.Module):
             raise ValueError(f"Unknown fusion_mode: {fusion_mode}")
         if self.fusion_dim != "2d":
             raise ValueError(f"fusion_mode: {self.fusion_mode} requires fusion_dim: 2d")
-        if self.cross_attn_type not in {"channel", "window", "shifted_window"}:
+        if self.cross_attn_type not in {"channel", "window", "shifted_window", "shifted_window_pair"}:
             raise ValueError(f"Unknown cross_attn_type: {cross_attn_type}")
         if self.swapped_kv_order not in self.SWAPPED_KV_ORDERS:
             raise ValueError(f"Unknown swapped_kv_order: {swapped_kv_order}")
