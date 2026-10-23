@@ -130,6 +130,7 @@ class RGBGated4CATests(unittest.TestCase):
             "train_tdc_evrb_6bin_rgb_gated4ca_scratch.yml",
             "eval_tdc_evrb_6bin_rgb_gated4ca_full.yml",
             "train_tdc_reblur_rgb_gated4ca_scratch.yml",
+            "train_tdc_reblur_rgb_gated4ca_rgb_e2_shifted_sa_scratch.yml",
             "train_tdc_reblur_rgb_gated4ca_conv3d_scratch.yml",
             "train_tdc_gopro_rgb_gated4ca_scratch.yml",
             "train_tdc_gopro_rgb_gated4ca_conv3d_scratch.yml",

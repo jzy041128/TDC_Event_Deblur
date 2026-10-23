@@ -257,6 +257,7 @@ def main():
         f"cross_attn_type: {model_cfg.get('cross_attn_type', 'channel')} | "
         f"swapped_kv_order: {model_cfg.get('swapped_kv_order', 'event3d_first')} | "
         f"encoder_sa: {model_cfg.get('encoder_self_attn', 'restormer_channel')} | "
+        f"encoder_sa(rgb/e2/e3): {'/'.join(unwrap_model(model).encoder_self_attn_types.values())} | "
         f"deform: {model_cfg.get('deform_alignment', 'none')} | "
         f"windows(self/cross/time): {model_cfg.get('self_attn_window_size', 8)}/"
         f"{model_cfg.get('cross_attn_window_size', 8)}/{model_cfg.get('temporal_window_size', 2)} | "

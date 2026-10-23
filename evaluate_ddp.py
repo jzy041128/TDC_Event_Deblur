@@ -276,6 +276,10 @@ def main():
         print(f"Config: {args.config}")
         print(f"Checkpoint: {args.checkpoint}")
         print(f"Event3D convolution: {model.event3d_conv_type}")
+        print(
+            "Encoder SA (RGB/Event2D/Event3D): "
+            + "/".join(model.encoder_self_attn_types.values())
+        )
         if exchange_changes:
             print(
                 f"Event exchange scale: {args.event_exchange_scale:g} | "

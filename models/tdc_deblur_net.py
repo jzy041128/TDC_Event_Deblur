@@ -1242,6 +1242,42 @@ class ThreeBranchStageFusion(nn.Module):
         return fused + self.gamma_ffn * self.ffn(self.norm_ffn(fused))
 
 
+def make_encoder_self_attention_2d(channels, attention_type, window_size, num_heads, qk_norm):
+    if attention_type == "window":
+        return WindowSelfAttention2D(channels, window_size, num_heads, qk_norm)
+    if attention_type == "plain_channel":
+        return PlainChannelSelfAttention2D(channels, num_heads, qk_norm)
+    if attention_type == "restormer_channel":
+        return RestormerChannelSelfAttention2D(channels, num_heads)
+    if attention_type == "restormer_window":
+        return RestormerWindowSelfAttention2D(channels, window_size, num_heads)
+    if attention_type == "restormer_shifted_window":
+        return RestormerShiftedWindowPair2D(channels, window_size, num_heads)
+    raise ValueError(f"Unknown encoder self-attention type: {attention_type}")
+
+
+def make_encoder_self_attention_3d(
+    channels, attention_type, spatial_window, temporal_window, num_heads, qk_norm
+):
+    if attention_type == "window":
+        return WindowSelfAttention3D(
+            channels, spatial_window, temporal_window, num_heads, qk_norm
+        )
+    if attention_type == "plain_channel":
+        return PlainChannelSelfAttention3D(channels, num_heads, qk_norm)
+    if attention_type == "restormer_channel":
+        return RestormerChannelSelfAttention3D(channels, num_heads)
+    if attention_type == "restormer_window":
+        return RestormerWindowSelfAttention3D(
+            channels, spatial_window, temporal_window, num_heads
+        )
+    if attention_type == "restormer_shifted_window":
+        return RestormerShiftedWindowPair3D(
+            channels, spatial_window, temporal_window, num_heads
+        )
+    raise ValueError(f"Unknown encoder self-attention type: {attention_type}")
+
+
 class ThreeBranchProgressiveDeblurNet(nn.Module):
     def __init__(
         self,
@@ -1267,6 +1303,9 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         sam_mode="none",
         refine_type="shallow",
         event3d_conv_type="tdc",
+        encoder_self_attn_rgb=None,
+        encoder_self_attn_event2d=None,
+        encoder_self_attn_event3d=None,
     ):
         super().__init__()
         event3d_conv_type = event3d_conv_type.lower()
@@ -1279,14 +1318,25 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         decoder_attention = decoder_attention.lower()
         sam_mode = sam_mode.lower()
         refine_type = refine_type.lower()
-        if encoder_self_attn not in {
+        self_attn_types = {
             "window",
             "plain_channel",
             "restormer_channel",
             "restormer_window",
             "restormer_shifted_window",
-        }:
+        }
+        if encoder_self_attn not in self_attn_types:
             raise ValueError(f"Unknown encoder_self_attn: {encoder_self_attn}")
+        self.encoder_self_attn_types = {}
+        for branch, override in (
+            ("rgb", encoder_self_attn_rgb),
+            ("event2d", encoder_self_attn_event2d),
+            ("event3d", encoder_self_attn_event3d),
+        ):
+            mode = encoder_self_attn if override is None else override
+            if not isinstance(mode, str) or mode.lower() not in self_attn_types:
+                raise ValueError(f"Unknown encoder_self_attn_{branch}: {mode}")
+            self.encoder_self_attn_types[branch] = mode.lower()
         if deform_alignment not in {"none", "image_guided"}:
             raise ValueError(f"Unknown deform_alignment: {deform_alignment}")
         if decoder_block not in {"plain", "residual"}:
@@ -1320,87 +1370,27 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
             ImageGuidedDeformAlignment2D(dim) if deform_alignment == "image_guided" else nn.Identity()
             for dim in dims
         ])
-        if encoder_self_attn == "window":
-            self.rgb_self_attn = nn.ModuleList([
-                WindowSelfAttention2D(dim, self_attn_window_size, num_heads, qk_norm) for dim in dims
-            ])
-            self.event2d_self_attn = nn.ModuleList([
-                WindowSelfAttention2D(dim, self_attn_window_size, num_heads, qk_norm) for dim in dims
-            ])
-            self.event3d_self_attn = nn.ModuleList([
-                WindowSelfAttention3D(
-                    dim,
-                    self_attn_window_size,
-                    temporal_window_size,
-                    num_heads,
-                    qk_norm,
-                )
-                for dim in dims
-            ])
-        elif encoder_self_attn == "plain_channel":
-            self.rgb_self_attn = nn.ModuleList([
-                PlainChannelSelfAttention2D(dim, num_heads, qk_norm) for dim in dims
-            ])
-            self.event2d_self_attn = nn.ModuleList([
-                PlainChannelSelfAttention2D(dim, num_heads, qk_norm) for dim in dims
-            ])
-            self.event3d_self_attn = nn.ModuleList([
-                PlainChannelSelfAttention3D(dim, num_heads, qk_norm) for dim in dims
-            ])
-        elif encoder_self_attn == "restormer_channel":
-            self.rgb_self_attn = nn.ModuleList([
-                RestormerChannelSelfAttention2D(dim, num_heads) for dim in dims
-            ])
-            self.event2d_self_attn = nn.ModuleList([
-                RestormerChannelSelfAttention2D(dim, num_heads) for dim in dims
-            ])
-            self.event3d_self_attn = nn.ModuleList([
-                RestormerChannelSelfAttention3D(dim, num_heads) for dim in dims
-            ])
-        elif encoder_self_attn == "restormer_window":
-            self.rgb_self_attn = nn.ModuleList([
-                RestormerWindowSelfAttention2D(
-                    dim, self_attn_window_size, num_heads
-                )
-                for dim in dims
-            ])
-            self.event2d_self_attn = nn.ModuleList([
-                RestormerWindowSelfAttention2D(
-                    dim, self_attn_window_size, num_heads
-                )
-                for dim in dims
-            ])
-            self.event3d_self_attn = nn.ModuleList([
-                RestormerWindowSelfAttention3D(
-                    dim,
-                    self_attn_window_size,
-                    temporal_window_size,
-                    num_heads,
-                )
-                for dim in dims
-            ])
-        else:
-            self.rgb_self_attn = nn.ModuleList([
-                RestormerShiftedWindowPair2D(
-                    dim, self_attn_window_size, num_heads
-                )
-                for dim in dims
-            ])
-            self.event2d_self_attn = nn.ModuleList([
-                RestormerShiftedWindowPair2D(
-                    dim, self_attn_window_size, num_heads
-                )
-                for dim in dims
-            ])
-            self.event3d_self_attn = nn.ModuleList([
-                RestormerShiftedWindowPair3D(
-                    dim,
-                    self_attn_window_size,
-                    temporal_window_size,
-                    num_heads,
-                )
-                for dim in dims
-            ])
+        # Missing branch overrides retain the legacy mode and initialization order.
+        self.rgb_self_attn = nn.ModuleList([
+            make_encoder_self_attention_2d(
+                dim, self.encoder_self_attn_types["rgb"], self_attn_window_size, num_heads, qk_norm
+            ) for dim in dims
+        ])
+        self.event2d_self_attn = nn.ModuleList([
+            make_encoder_self_attention_2d(
+                dim, self.encoder_self_attn_types["event2d"], self_attn_window_size, num_heads, qk_norm
+            ) for dim in dims
+        ])
+        self.event3d_self_attn = nn.ModuleList([
+            make_encoder_self_attention_3d(
+                dim,
+                self.encoder_self_attn_types["event3d"],
+                self_attn_window_size,
+                temporal_window_size,
+                num_heads,
+                qk_norm,
+            ) for dim in dims
+        ])
         self.fusions = nn.ModuleList([
             ThreeBranchStageFusion(
                 dim,
