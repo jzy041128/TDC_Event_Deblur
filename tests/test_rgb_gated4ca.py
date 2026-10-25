@@ -132,6 +132,7 @@ class RGBGated4CATests(unittest.TestCase):
             "train_tdc_reblur_rgb_gated4ca_scratch.yml",
             "train_tdc_reblur_rgb_gated4ca_rgb_e2_shifted_sa_scratch.yml",
             "train_tdc_reblur_rgb_gated4ca_channel_3gpu_scratch.yml",
+            "train_tdc_reblur_rgb_gated4ca_e3_shifted_sa_3gpu_scratch.yml",
             "train_tdc_reblur_rgb_gated4ca_swin_ca_3gpu_scratch.yml",
             "train_tdc_reblur_rgb_gated4ca_swin_sa_ca_3gpu_scratch.yml",
             "train_tdc_reblur_rgb_gated4ca_conv3d_scratch.yml",
