@@ -17,6 +17,9 @@ from skimage.metrics import structural_similarity as calculate_ssim
 from data.dataset import build_dataset
 from models.losses import build_loss
 from models.tdc_deblur_net import build_deblur_model
+from utils.model_checkpoint import (
+    checkpoint_metadata, fusion_description, load_pretrained_weights, validate_pretrain_options,
+)
 from utils.reproducibility import (
     EpochRandomSampler,
     capture_rng_state,
@@ -106,6 +109,7 @@ def main():
     # 2. 建立实验文件夹；恢复训练时继续使用 checkpoint 所在目录
     resume_path = config['path'].get('resume_state')
     pretrain_path = config['path'].get('pretrain_model')
+    backbone_only = validate_pretrain_options(config['path'])
     if configured_path(resume_path) and configured_path(pretrain_path):
         raise ValueError('Set only one of path.resume_state and path.pretrain_model.')
     resume_mode = resume_path and resume_path != '~' and os.path.exists(resume_path)
@@ -160,6 +164,10 @@ def main():
     # 5. 初始化模型、损失函数、优化器
     model_cfg = dict(config.get('model', {}))
     model = build_deblur_model(**model_cfg).to(device)
+    description = fusion_description(model)
+    if description:
+        print(description)
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(
         f"Model: three_branch_progressive | base_dim: {model_cfg.get('base_dim', 32)} | "
         f"fusion_mode: {model_cfg.get('fusion_mode', 'bidirectional_event_then_rgb_ca')} | "
@@ -194,8 +202,7 @@ def main():
         checkpoint = torch.load(pretrain_path, map_location=device, weights_only=False)
         if 'model_state_dict' not in checkpoint:
             raise KeyError(f'Checkpoint has no model_state_dict: {pretrain_path}')
-        model.validate_event3d_checkpoint(checkpoint)
-        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
+        print(load_pretrained_weights(model, checkpoint, backbone_only))
         print(f'Loaded pretrained model weights: {pretrain_path}')
         print('Optimizer is new; training starts from epoch 0 in a new experiment directory.')
     elif configured_path(resume_path):
@@ -207,6 +214,8 @@ def main():
             try:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             except ValueError as err:
+                if model.fusion_options is not None:
+                    raise ValueError("Temporal fusion resume requires a matching optimizer state; use pretraining for initialization transfer") from err
                 print("⚠️ Optimizer state does not match current parameters; optimizer is reinitialized.")
                 print(f"   Reason: {err}")
             start_epoch = checkpoint['epoch']
@@ -218,6 +227,8 @@ def main():
                 best_psnr = log_best_psnr
             print(f"✅ 成功恢复至第 {start_epoch} 个 Epoch！历史最佳 PSNR: {best_psnr:.2f} dB")
         else:
+            if model.fusion_options is not None:
+                raise FileNotFoundError(f"Temporal fusion resume checkpoint not found: {resume_path}")
             print(f"⚠️ 找不到存档文件 {resume_path}，将从头开始训练！")
 
     # 7. 开始训练大循环
@@ -321,6 +332,7 @@ def main():
             'best_psnr': best_psnr,
             'rng_state': capture_rng_state(),
             'seed': seed,
+            **checkpoint_metadata(model, config.get('model', {})),
         }
         
         # 1. 每跑完一个 Epoch，覆盖保存一次 latest.pth (防停电)

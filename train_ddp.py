@@ -20,6 +20,9 @@ from data.dataset import build_dataset
 from models.losses import build_loss
 from models.tdc_deblur_net import build_deblur_model
 from utils.reproducibility import capture_rng_state, restore_rng_state, seed_worker, set_global_seed
+from utils.model_checkpoint import (
+    checkpoint_metadata, fusion_description, load_pretrained_weights, validate_pretrain_options,
+)
 
 
 class Logger(object):
@@ -235,6 +238,7 @@ def main():
 
     resume_path = config["path"].get("resume_state")
     pretrain_path = config["path"].get("pretrain_model")
+    backbone_only = validate_pretrain_options(config["path"])
     if configured_path(resume_path) and configured_path(pretrain_path):
         raise ValueError("Set only one of path.resume_state and path.pretrain_model.")
     exp_dir, resume_mode = make_experiment_dir(config, resume_path)
@@ -249,6 +253,10 @@ def main():
 
     train_loader, train_sampler, val_loader = build_loaders(config, rank, world_size, seed, deterministic)
     model = build_model(config, device)
+    description = fusion_description(unwrap_model(model))
+    if description:
+        print(description)
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     model_cfg = config.get("model", {})
     print(
         f"Model: three_branch_progressive | base_dim: {model_cfg.get('base_dim', 32)} | "
@@ -285,9 +293,9 @@ def main():
         checkpoint = torch.load(pretrain_path, map_location=device, weights_only=False)
         if "model_state_dict" not in checkpoint:
             raise KeyError(f"Checkpoint has no model_state_dict: {pretrain_path}")
-        unwrap_model(model).validate_event3d_checkpoint(checkpoint)
-        unwrap_model(model).load_state_dict(checkpoint["model_state_dict"], strict=True)
+        transfer_message = load_pretrained_weights(unwrap_model(model), checkpoint, backbone_only)
         if rank0():
+            print(transfer_message)
             print(f"Loaded pretrained model weights: {pretrain_path}")
             print("Optimizer is new; training starts from epoch 0 in a new experiment directory.")
     elif configured_path(resume_path):
@@ -298,6 +306,8 @@ def main():
             try:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             except ValueError:
+                if unwrap_model(model).fusion_options is not None:
+                    raise ValueError("Temporal fusion resume requires a matching optimizer state; use pretraining for initialization transfer")
                 print("Optimizer state mismatch; optimizer is reinitialized.")
             start_epoch = checkpoint["epoch"]
             best_psnr = max(checkpoint.get("best_psnr", 0.0), parse_best_psnr_from_log(os.path.join(exp_dir, "train_log.txt")))
@@ -306,6 +316,8 @@ def main():
                 restore_rng_state(rng_states[rank])
             print(f"Resume from epoch {start_epoch}, best_psnr={best_psnr:.2f}")
         else:
+            if unwrap_model(model).fusion_options is not None:
+                raise FileNotFoundError(f"Temporal fusion resume checkpoint not found: {resume_path}")
             print(f"Resume path not found: {resume_path}. Start from scratch.")
 
     num_epochs = config["train"]["num_epochs"]
@@ -395,6 +407,7 @@ def main():
                 "best_psnr": best_psnr,
                 "rng_states": rng_states,
                 "seed": seed,
+                **checkpoint_metadata(unwrap_model(model), config.get("model", {})),
             }
             torch.save(save_dict, os.path.join(exp_dir, "latest.pth"))
             if is_best:

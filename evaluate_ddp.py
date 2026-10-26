@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, Sampler, Subset
 from data.dataset import build_dataset
 from models.tdc_deblur_net import EventThenRGBFourCrossAttention2D, build_deblur_model
 from utils.reproducibility import set_global_seed
+from utils.model_checkpoint import fusion_description
 
 
 class RankStrideSampler(Sampler):
@@ -261,6 +262,9 @@ def main():
         raise KeyError(f"Checkpoint has no model_state_dict: {args.checkpoint}")
     model.validate_event3d_checkpoint(checkpoint)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    description = fusion_description(model)
+    if rank == 0 and description:
+        print(description)
     exchange_changes = (
         scale_event_exchange(model, args.event_exchange_scale)
         if args.event_exchange_scale is not None

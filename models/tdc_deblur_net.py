@@ -1,3 +1,4 @@
+import copy
 import math
 
 import torch
@@ -5,6 +6,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.ops import DeformConv2d
 
+from models.fusion_common import (
+    ChannelLayerNorm2D, ChannelLayerNorm3D, EventImageChannelCrossAttention2D,
+)
+from models.temporal_event_fusion import (
+    TEMPORAL_FUSION_MODES, build_temporal_fusion, normalize_fusion_options,
+)
 from models.tdc_module import ShortTermTDCBlock3D
 
 
@@ -99,24 +106,6 @@ class LightUNetRefineNet(nn.Module):
         x0 = self.stem(torch.cat([feature, stage1_image, blur], dim=1))
         x1 = self.bottleneck(self.down(x0))
         return stage1_image + self.to_image(self.up(x1, x0))
-
-
-class ChannelLayerNorm2D(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.norm = nn.LayerNorm(channels)
-
-    def forward(self, x):
-        return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
-
-
-class ChannelLayerNorm3D(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.norm = nn.LayerNorm(channels)
-
-    def forward(self, x):
-        return self.norm(x.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3).contiguous()
 
 
 class PlainChannelSelfAttention2D(nn.Module):
@@ -771,39 +760,6 @@ class ShiftedWindowCrossAttentionPair2D(nn.Module):
         return (first_delta + second_delta)[:, :, :height, :width]
 
 
-class EventImageChannelCrossAttention2D(nn.Module):
-    def __init__(self, channels, num_heads):
-        super().__init__()
-        if channels % num_heads:
-            raise ValueError("channels must be divisible by num_heads")
-        self.num_heads = num_heads
-        self.norm_q = ChannelLayerNorm2D(channels)
-        self.norm_k = ChannelLayerNorm2D(channels)
-        self.norm_v = ChannelLayerNorm2D(channels)
-        self.q = nn.Conv2d(channels, channels, 1, bias=False)
-        self.k = nn.Conv2d(channels, channels, 1, bias=False)
-        self.v = nn.Conv2d(channels, channels, 1, bias=False)
-        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
-        self.proj = nn.Conv2d(channels, channels, 1, bias=False)
-
-    def forward(self, query, key, value=None):
-        value = key if value is None else value
-        if query.shape != key.shape or query.shape != value.shape:
-            raise ValueError("query, key, and value must have the same shape")
-        b, c, h, w = query.shape
-        head_dim = c // self.num_heads
-
-        q = self.q(self.norm_q(query)).view(b, self.num_heads, head_dim, h * w)
-        k = self.k(self.norm_k(key)).view(b, self.num_heads, head_dim, h * w)
-        v = self.v(self.norm_v(value)).view(b, self.num_heads, head_dim, h * w)
-
-        q = F.normalize(q, dim=-1)
-        k = F.normalize(k, dim=-1)
-        weights = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) * self.temperature, dim=-1)
-        out = torch.matmul(weights, v).view(b, c, h, w)
-        return self.proj(out)
-
-
 class EventReorganizedChannelCrossAttention2D(nn.Module):
     """Read event content through a shared reference-channel coordinate system."""
 
@@ -1128,7 +1084,7 @@ class ThreeBranchStageFusion(nn.Module):
     }
     DIRECT_EVENT_RGB_MODES = {"direct_event_to_rgb_2ca"}
     EVENT_THEN_RGB_MODES = FOUR_CA_MODES | DIRECT_EVENT_RGB_MODES
-    VALID_MODES = SELECTABLE_CA_MODES | EVENT_REORG_MODES | SOFT_ROUTED_DUAL_MODES
+    VALID_MODES = SELECTABLE_CA_MODES | EVENT_REORG_MODES | SOFT_ROUTED_DUAL_MODES | TEMPORAL_FUSION_MODES
 
     def __init__(
         self,
@@ -1141,16 +1097,36 @@ class ThreeBranchStageFusion(nn.Module):
         num_heads,
         qk_norm,
         gamma_init,
+        stage_index=0,
+        fusion_options=None,
     ):
         super().__init__()
         self.fusion_mode = fusion_mode.lower()
         self.fusion_dim = fusion_dim.lower()
         self.cross_attn_type = cross_attn_type.lower()
         self.swapped_kv_order = swapped_kv_order.lower()
+        if fusion_options is not None and not isinstance(fusion_options, dict):
+            raise ValueError("fusion_options must be a dictionary or null")
         if self.fusion_mode not in self.VALID_MODES:
             raise ValueError(f"Unknown fusion_mode: {fusion_mode}")
         if self.fusion_dim != "2d":
             raise ValueError(f"fusion_mode: {self.fusion_mode} requires fusion_dim: 2d")
+        if self.fusion_mode in TEMPORAL_FUSION_MODES:
+            if self.cross_attn_type != "channel":
+                raise ValueError("Temporal fusion modes require cross_attn_type: channel")
+            # New fusion initialization must not move the shared A-backbone RNG stream.
+            with torch.random.fork_rng(devices=[]):
+                self.temporal_fusion = build_temporal_fusion(
+                    self.fusion_mode, channels, num_heads, gamma_init, stage_index, fusion_options
+                )
+            reference = ThreeBranchStageFusion(
+                channels, "rgb_gated_event_then_rgb_4ca", fusion_dim, cross_attn_type,
+                swapped_kv_order, cross_window_size, num_heads, qk_norm, gamma_init,
+            )
+            self.norm_ffn, self.ffn, self.gamma_ffn = reference.norm_ffn, reference.ffn, reference.gamma_ffn
+            return
+        if fusion_options:
+            raise ValueError("fusion_options are supported only by the five temporal fusion modes")
         if self.cross_attn_type not in {"channel", "window", "shifted_window", "shifted_window_pair"}:
             raise ValueError(f"Unknown cross_attn_type: {cross_attn_type}")
         if self.swapped_kv_order not in self.SWAPPED_KV_ORDERS:
@@ -1258,6 +1234,9 @@ class ThreeBranchStageFusion(nn.Module):
         )
 
     def forward(self, rgb, event2d, event3d):
+        if self.fusion_mode in TEMPORAL_FUSION_MODES:
+            fused = self.temporal_fusion(rgb, event2d, event3d)
+            return fused + self.gamma_ffn * self.ffn(self.norm_ffn(fused))
         event3d = event3d.mean(dim=2)
         if self.fusion_mode == "swapped_kv_cascaded_ca":
             fused = self.swapped_kv_cascade_2d(rgb, event2d, event3d)
@@ -1336,8 +1315,20 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
         encoder_self_attn_rgb=None,
         encoder_self_attn_event2d=None,
         encoder_self_attn_event3d=None,
+        fusion_options=None,
     ):
         super().__init__()
+        self.fusion_mode = fusion_mode.lower()
+        if fusion_options is not None and not isinstance(fusion_options, dict):
+            raise ValueError("fusion_options must be a dictionary or null")
+        self.fusion_options = normalize_fusion_options(fusion_options) if self.fusion_mode in TEMPORAL_FUSION_MODES else None
+        self.checkpoint_config = {
+            key: copy.deepcopy(value) for key, value in locals().items()
+            if key not in {"self", "__class__"}
+        }
+        if self.fusion_mode not in TEMPORAL_FUSION_MODES and fusion_options:
+            raise ValueError("fusion_options are supported only by the five temporal fusion modes")
+        self.event_in, self.base_dim, self.tdc_kernel_size = event_in, base_dim, tdc_kernel_size
         event3d_conv_type = event3d_conv_type.lower()
         if event3d_conv_type not in {"tdc", "conv3d"}:
             raise ValueError(f"Unknown event3d_conv_type: {event3d_conv_type}")
@@ -1432,8 +1423,10 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
                 num_heads,
                 qk_norm,
                 gamma_init,
+                stage_index=stage_index,
+                fusion_options=self.fusion_options,
             )
-            for dim in dims
+            for stage_index, dim in enumerate(dims)
         ])
         up_block = UpBlock if decoder_block == "plain" else ResidualUpBlock
         self.up1 = up_block(dims[2], dims[1], dims[1])
@@ -1454,7 +1447,7 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
             refine_net = ShallowRefineNet if refine_type == "shallow" else LightUNetRefineNet
             self.refine = refine_net(dims[0], rgb_in)
 
-    def validate_event3d_checkpoint(self, checkpoint):
+    def validate_event3d_checkpoint(self, checkpoint, allow_fusion_transfer=False):
         # Legacy checkpoints predate the switch and always used TDC.
         saved_type = checkpoint.get("event3d_conv_type", "tdc")
         if saved_type != self.event3d_conv_type:
@@ -1463,6 +1456,24 @@ class ThreeBranchProgressiveDeblurNet(nn.Module):
                 f"model event3d_conv_type={self.event3d_conv_type!r}. "
                 "Use the matching configuration; train convolution ablations separately."
             )
+        if allow_fusion_transfer:
+            return
+        saved_mode = checkpoint.get("fusion_mode")
+        if saved_mode is None and self.fusion_mode in TEMPORAL_FUSION_MODES:
+            raise ValueError("Temporal fusion checkpoints require fusion metadata; use explicit backbone-only initialization for legacy weights")
+        if saved_mode is not None and saved_mode != self.fusion_mode:
+            raise ValueError(f"Checkpoint fusion_mode={saved_mode!r} does not match model {self.fusion_mode!r}")
+        if self.fusion_mode in TEMPORAL_FUSION_MODES:
+            if checkpoint.get("fusion_options") != self.fusion_options:
+                raise ValueError("Checkpoint fusion_options do not match this model; resume requires the same structure/options")
+        saved_config = checkpoint.get("resolved_model_config")
+        if saved_config is not None:
+            for key in self.checkpoint_config:
+                if key not in {"gamma_init", "fusion_options"} and saved_config.get(key) != self.checkpoint_config[key]:
+                    raise ValueError(f"Checkpoint model setting {key!r} does not match; use the saved training configuration")
+        for key, actual in (("event_in", self.event_in), ("base_dim", self.base_dim), ("tdc_kernel_size", self.tdc_kernel_size)):
+            if key in checkpoint and checkpoint[key] != actual:
+                raise ValueError(f"Checkpoint {key} does not match this model")
 
     def attend(self, scale, rgb, event2d, event3d):
         rgb = self.rgb_alignment[scale](rgb)
