@@ -173,6 +173,13 @@ that every later image/shape fits. Keep sufficient VRAM headroom.
 
 If preflight succeeds, start the first experiment from a fresh SSH terminal:
 
+Success requires both the final `Preflight PASS` marker and a normal torchrun
+exit without NCCL/CUDA errors. Memory numbers printed before an error do not
+constitute a complete pass. The tool synchronizes every rank after the memory
+all-reduce, then barriers and synchronizes before process-group destruction.
+This removes an unchecked shutdown race; a remaining NCCL error still requires
+communication/device diagnostics and must not be dismissed as harmless.
+
 ```bash
 tmux new -As reblur_temporal1_3gpu
 conda activate tdc_deblur

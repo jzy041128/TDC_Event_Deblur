@@ -28,8 +28,22 @@ def report_peak(label, device):
     if dist.is_initialized():
         peaks = torch.tensor([allocated, reserved], device=device)
         dist.all_reduce(peaks, op=dist.ReduceOp.MAX)
+        # Every rank must finish this CUDA collective before its temporary tensor
+        # or process group can be released, not only rank 0 reading the result.
+        torch.cuda.synchronize(device)
         if dist.get_rank() == 0:
             print(f"{label}: max across ranks allocated={peaks[0].item():.3f} GiB, reserved={peaks[1].item():.3f} GiB")
+
+
+def finish_preflight(device, world_size):
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    torch.cuda.synchronize(device)
+    if dist.is_initialized():
+        dist.barrier(device_ids=[device.index])
+        torch.cuda.synchronize(device)
+        dist.destroy_process_group()
+    if rank == 0:
+        print(f"Preflight PASS: checks and synchronized shutdown complete; world_size={world_size}.", flush=True)
 
 
 def main():
@@ -125,8 +139,7 @@ def main():
             del pred, blur, event
     report_peak("Complete-image validation", device)
     print(f"No checkpoint/config written. DDP world_size={world_size}; unsampled image shapes are not covered.")
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    finish_preflight(device, world_size)
 
 
 if __name__ == "__main__":
