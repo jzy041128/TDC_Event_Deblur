@@ -53,12 +53,28 @@ def fusion_description(model):
     local_widths = [max(c // opt["local_st_reduction"], opt["local_st_min_dim"]) for c in dims]
     local_stages = [i for i, stage in enumerate(model.fusions)
                     if any(type(module).__name__ == "LocalSTRead" for module in stage.temporal_fusion.modules())]
+    readers = [[type(module).__name__ for module in stage.temporal_fusion.modules()
+                if type(module).__name__ in {"ConditionalTemporalRead", "UniformTemporalRead", "LocalSTRead"}]
+               for stage in model.fusions]
+    local_details = [
+        {"stage": i, "heads": module.num_heads, "width": module.width,
+         "kernel": module.kernel_size, "spatial_bias": module.spatial_bias is not None}
+        for i, stage in enumerate(model.fusions) for module in stage.temporal_fusion.modules()
+        if type(module).__name__ == "LocalSTRead"
+    ]
+    readout_note = (
+        "uniform mean of normed/projected V, no RGB/E2-conditioned weights"
+        if opt.get("e3_readout") == "mean" else "conditional attention"
+    )
+    projection_label = "V-only widths" if opt.get("e3_readout") == "mean" else "temporal Q/K/V widths"
     return (
-        f"Temporal fusion stages: {stages} | E3 input: full 5D, no temporal mean | "
-        f"temporal Q/K/V widths by stage={temporal_widths} | "
+        f"Temporal fusion stages: {stages} | E3 input: full 5D, no pre-fusion temporal mean | "
+        f"readers by stage={readers} | readout={readout_note} | "
+        f"{projection_label} by stage={temporal_widths} | "
         f"local Q/K/V total widths={local_widths}, heads={opt['local_st_heads']}, "
         f"per-head widths={[width // opt['local_st_heads'] for width in local_widths]}, "
         f"actual local stages={local_stages}, chunk={opt['local_st_query_chunk']}, "
         f"local checkpoint={opt['local_st_checkpoint_chunks'] if local_stages else 'not used'} | "
+        f"actual local reader details={local_details} | "
         "shared initialization reference: RGB-gated 4CA (untrained) | precision: float32"
     )

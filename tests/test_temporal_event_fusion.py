@@ -51,7 +51,9 @@ class TemporalFusionOperatorTests(unittest.TestCase):
         a["local_st_scales"].append(0)
         self.assertEqual(normalize_fusion_options()["local_st_scales"], [2])
         for opt in ({"typo": 1}, {"dynamic_kernel_size": 5}, {"local_st_kernel_size": 1},
-                    {"temporal_position": "fixed"}, {"gru_scales": [0, 1, 2]},
+                    {"temporal_position": "fixed"}, {"gru_scales": [0, 1, 3]},
+                    {"local_st_scales": [0, 0]}, {"local_st_scales": []},
+                    {"local_st_scales": [True]}, {"local_st_scales": "all"},
                     {"temporal_min_dim": 0}, {"local_st_checkpoint_chunks": 1},
                     {"gru_hidden_ratio": 0.25}, {"dynamic_kernel_gain": float("nan")}):
             with self.subTest(opt=opt), self.assertRaises(ValueError):

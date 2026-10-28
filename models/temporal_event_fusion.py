@@ -33,7 +33,7 @@ def normalize_fusion_options(options=None):
     if options is not None and not isinstance(options, dict):
         raise ValueError("fusion_options must be a dictionary or null")
     result = copy.deepcopy(DEFAULT_FUSION_OPTIONS)
-    unknown = set(options or {}) - set(result)
+    unknown = set(options or {}) - set(result) - {"e3_readout"}
     if unknown:
         raise ValueError(f"Unknown fusion_options: {sorted(unknown)}")
     result.update(copy.deepcopy(options or {}))
@@ -51,8 +51,26 @@ def normalize_fusion_options(options=None):
         if type(result[key]) is not int or result[key] != 3:
             raise ValueError(f"MVP requires {key}=3")
     for key in ("local_st_scales", "gru_scales"):
-        if result[key] != [2] or any(type(x) is not int for x in result[key]):
-            raise ValueError(f"MVP requires {key}=[2]; heavy readers run only at stage 2")
+        scales = result[key]
+        if (not isinstance(scales, list) or not scales
+                or any(type(x) is not int or x not in (0, 1, 2) for x in scales)
+                or len(set(scales)) != len(scales)):
+            raise ValueError(f"fusion_options.{key} must contain unique stage indices from 0, 1, 2")
+    if "e3_readout" in result:
+        if result["e3_readout"] not in ("mean", "temporal", "local"):
+            raise ValueError("fusion_options.e3_readout must be mean, temporal or local")
+        # New matched experiments are all-scale and single-head; legacy defaults stay unchanged.
+        if "local_st_heads" not in (options or {}):
+            result["local_st_heads"] = 1
+        if "local_st_scales" not in (options or {}):
+            result["local_st_scales"] = [0, 1, 2]
+        if result["local_st_heads"] != 1:
+            raise ValueError("Matched e3_readout experiments require local_st_heads=1")
+        if result["local_st_scales"] != [0, 1, 2]:
+            raise ValueError("Matched e3_readout experiments use all three stages: local_st_scales=[0,1,2]")
+        if (result["local_st_reduction"] != result["temporal_reduction"]
+                or result["local_st_min_dim"] != result["temporal_min_dim"]):
+            raise ValueError("Matched e3_readout experiments require identical temporal/local projection widths")
     if type(result["local_st_checkpoint_chunks"]) is not bool:
         raise ValueError("local_st_checkpoint_chunks must be boolean")
     gain = result["dynamic_kernel_gain"]
@@ -139,6 +157,28 @@ class ConditionalTemporalRead(_ProjectedReader):
         return (result, weights) if return_weights else result
 
 
+class UniformTemporalRead(nn.Module):
+    def __init__(self, channels, condition_channels, reduction=4, min_dim=8):
+        super().__init__()
+        # Consume the same initialization draws, retaining only modules used by mean(V).
+        reference = ConditionalTemporalRead(channels, condition_channels, reduction, min_dim)
+        self.channels, self.width = reference.channels, reference.width
+        self.n_sources = condition_channels // channels
+        self.norm_v, self.v_proj, self.out_proj = reference.norm_v, reference.v_proj, reference.out_proj
+
+    def forward(self, query_sources, event3d, return_weights=False):
+        if not isinstance(query_sources, (tuple, list)) or len(query_sources) != self.n_sources:
+            raise ValueError("query_sources count does not match condition_channels")
+        for source in query_sources:
+            _check_inputs(query_sources[0], source, event3d, self.channels)
+        values = self.v_proj(self.norm_v(event3d))
+        result = self.out_proj(values.mean(dim=2)).to(query_sources[0].dtype)
+        if not return_weights:
+            return result
+        b, _, t, h, w = event3d.shape
+        return result, event3d.new_full((b, t, h, w), 1.0 / t)
+
+
 class SpatialGate(nn.Module):
     def __init__(self, channels, n_inputs, n_gates=1, reduction=4, min_dim=8):
         super().__init__()
@@ -161,26 +201,33 @@ class SpatialGate(nn.Module):
 
 class LocalSTRead(_ProjectedReader):
     def __init__(self, channels, condition_channels, num_heads=4, reduction=4, min_dim=8,
-                 query_chunk=512, checkpoint_chunks=True):
+                 query_chunk=512, checkpoint_chunks=True, kernel_size=3, spatial_bias=True):
         width = max(channels // reduction, min_dim)
         if num_heads < 1 or width % num_heads:
             raise ValueError("LocalSTRead total projection width must be divisible by heads")
         if query_chunk < 1:
             raise ValueError("LocalSTRead query_chunk must be positive")
+        if type(kernel_size) is not int or kernel_size not in (1, 3):
+            raise ValueError("LocalSTRead kernel_size must be 1 or 3")
+        if type(spatial_bias) is not bool:
+            raise ValueError("LocalSTRead spatial_bias must be boolean")
         super().__init__(channels, condition_channels, width)
         self.num_heads = num_heads
         self.head_dim = width // num_heads
         self.query_chunk = query_chunk
         self.checkpoint_chunks = checkpoint_chunks
+        self.kernel_size, self.neighbor_count = kernel_size, kernel_size ** 2
         self.time_bias = TemporalPositionBias(num_heads)
-        self.spatial_bias = nn.Parameter(torch.zeros(num_heads, 9))
+        self.spatial_bias = nn.Parameter(torch.zeros(num_heads, self.neighbor_count)) if spatial_bias else None
         self._neighbor_cache = None
 
     def neighbors(self, height, width, device):
         key = (height, width, device)
         if self._neighbor_cache is None or self._neighbor_cache[0] != key:
             y, x = torch.meshgrid(torch.arange(height, device=device), torch.arange(width, device=device), indexing="ij")
-            dy, dx = torch.meshgrid(torch.arange(-1, 2, device=device), torch.arange(-1, 2, device=device), indexing="ij")
+            radius = self.kernel_size // 2
+            offsets = torch.arange(-radius, radius + 1, device=device)
+            dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
             yy, xx = y.flatten()[:, None] + dy.flatten(), x.flatten()[:, None] + dx.flatten()
             valid = (yy >= 0) & (yy < height) & (xx >= 0) & (xx < width)
             index = yy.clamp(0, height - 1) * width + xx.clamp(0, width - 1)
@@ -192,6 +239,7 @@ class LocalSTRead(_ProjectedReader):
         q, k, v = self.project(query_sources, event3d)
         b, _, height, width = q.shape
         length, n = event3d.shape[2], height * width
+        neighbors = self.neighbor_count
         q = q.reshape(b, self.num_heads, self.head_dim, n).permute(0, 1, 3, 2)
         k = k.reshape(b, self.num_heads, self.head_dim, length, n).permute(0, 1, 3, 4, 2)
         v = v.reshape(b, self.num_heads, self.head_dim, length, n).permute(0, 1, 3, 4, 2)
@@ -205,17 +253,21 @@ class LocalSTRead(_ProjectedReader):
             def read_chunk(q_all, k_all, v_all, tb, sb, start=start, end=end):
                 idx, mask = index[start:end], valid[start:end]
                 kc = k_all.index_select(3, idx.reshape(-1)).reshape(
-                    b, self.num_heads, length, end - start, 9, self.head_dim
+                    b, self.num_heads, length, end - start, neighbors, self.head_dim
                 ).permute(0, 1, 3, 2, 4, 5).reshape(
-                    b, self.num_heads, end - start, length * 9, self.head_dim
+                    b, self.num_heads, end - start, length * neighbors, self.head_dim
                 )
                 vc = v_all.index_select(3, idx.reshape(-1)).reshape(
-                    b, self.num_heads, length, end - start, 9, self.head_dim
+                    b, self.num_heads, length, end - start, neighbors, self.head_dim
                 ).permute(0, 1, 3, 2, 4, 5).reshape_as(kc)
                 with torch.autocast(device_type=q_all.device.type, enabled=False):
                     logits = torch.einsum("bhnd,bhnld->bhnl", q_all[:, :, start:end].float(), kc.float()) / math.sqrt(self.head_dim)
-                    bias = (tb.float()[:, :, None] + sb.float()[:, None, :]).reshape(self.num_heads, 1, length * 9)
-                    mask = mask[:, None, :].expand(-1, length, -1).reshape(end - start, length * 9)
+                    if sb is None:
+                        bias = tb.float()[:, :, None].expand(-1, -1, neighbors)
+                    else:
+                        bias = tb.float()[:, :, None] + sb.float()[:, None, :]
+                    bias = bias.reshape(self.num_heads, 1, length * neighbors)
+                    mask = mask[:, None, :].expand(-1, length, -1).reshape(end - start, length * neighbors)
                     logits = (logits + bias).masked_fill(~mask[None, None], float("-inf"))
                     weights = torch.softmax(logits, dim=-1)
                 return torch.einsum("bhnl,bhnld->bhnd", weights.to(vc.dtype), vc)
@@ -267,6 +319,20 @@ class _FusionBase(nn.Module):
         return nn.Parameter(torch.full((1,), float(self.gamma_init)))
 
     def temporal_reader(self, sources=2):
+        kind = self.options.get("e3_readout", "temporal")
+        if kind == "mean":
+            return UniformTemporalRead(
+                self.channels, self.channels * sources,
+                self.options["temporal_reduction"], self.options["temporal_min_dim"],
+            )
+        if kind == "local":
+            return LocalSTRead(
+                self.channels, self.channels * sources, num_heads=1,
+                reduction=self.options["temporal_reduction"], min_dim=self.options["temporal_min_dim"],
+                query_chunk=self.options["local_st_query_chunk"],
+                checkpoint_chunks=self.options["local_st_checkpoint_chunks"],
+                kernel_size=3, spatial_bias=False,
+            )
         return ConditionalTemporalRead(
             self.channels, self.channels * sources,
             self.options["temporal_reduction"], self.options["temporal_min_dim"],
@@ -421,6 +487,8 @@ class IdentityPreservingDualExpertFusion(_FusionBase):
 
 def build_temporal_fusion(mode, channels, num_heads, gamma_init, stage_index, fusion_options=None):
     options = normalize_fusion_options(fusion_options)
+    if "e3_readout" in options and mode != "cond_temporal_2ca":
+        raise ValueError("e3_readout is supported only by cond_temporal_2ca; other modes keep their own fusion structure")
     if stage_index not in (0, 1, 2):
         raise ValueError("stage_index must be 0, 1 or 2")
     if mode == "anchored_local_st" and stage_index not in options["local_st_scales"]:

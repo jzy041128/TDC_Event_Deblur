@@ -11,6 +11,100 @@ The common outer norm_ffn/ffn/gamma_ffn runs exactly once per stage. Intermediat
 event memories do not overwrite the E2/E3 encoder streams at the next stage.
 fusion_dim=2d specifies the output, not the input E3 dimensionality.
 
+## New experiment decisions (2026-10-28)
+
+- Unless the user explicitly requests otherwise, future fusion experiments must
+  use the intended fusion/reader consistently at all three stages: 0, 1 and 2.
+  Do not silently substitute another fusion at finer stages to save resources.
+  Measure memory first; report a resource limit before proposing a scope change.
+- The agreed mean baseline is projected uniform temporal pooling:
+  M = out_proj(v_proj(norm_v(E3)).mean(dim=2)). Keep the same value normalization,
+  value projection, output projection and downstream CA/Inject/gate/residual/FFN
+  structure as the conditional temporal experiment. Replace adaptive temporal
+  weights by 1/T; do not substitute raw E3.mean(dim=2) or the legacy Direct 2CA.
+- These decisions are implemented by the matched readout configurations below.
+  Preserve historical configurations and checkpoints. The earlier coarse/hybrid
+  table records historical experiments, not the default for new experiments.
+
+## Matched all-scale readout study
+
+All three configurations use fusion_mode=cond_temporal_2ca, with an explicit
+fusion_options.e3_readout switch. Only the experiment name and this switch
+differ between their YAML files. Each selected reader runs at stages 0, 1 and 2;
+no stage falls back to another reader. The common RGB/E2 CA, subsequent E3 CA,
+Inject convolutions, gate, residuals and outer FFN are identical.
+
+| e3_readout | Config under configs/ | Reader |
+| --- | --- | --- |
+| mean | train_tdc_reblur_mean_v_2ca_allscales_3gpu_scratch.yml | UniformTemporalRead: mean of normalized/projected V, followed by out_proj |
+| temporal | train_tdc_reblur_temporal_2ca_allscales_3gpu_scratch.yml | Original single-head ConditionalTemporalRead |
+| local | train_tdc_reblur_local_st_2ca_allscales_3gpu_scratch.yml | Single-head LocalSTRead, 3x3 neighborhood, followed by the same E3 CA |
+
+- Q/K/V widths are 8/16/32 at C=32/64/128. The mean reader keeps V/out_proj only;
+  it neither calculates Q/K nor registers unused Q/K or time-bias parameters.
+  This is a pooling-module ablation, not a parameter-matched proof that RGB/E2
+  guidance alone is responsible for a gain.
+- Temporal and local readers use one head and the same normalization, Q/K/V,
+  output projections and learned time-bias MLP. The new local reader has no
+  additional learned spatial bias, so enlarging 1x1 to 3x3 adds candidates rather
+  than another positional parameter family. Existing four-head local modes keep
+  their original learned spatial bias and formulas.
+- At base_dim=32/event_in=6 the parameter counts are mean=2,960,299 and
+  temporal=local=2,977,966. These are parameter counts, not GPU-memory estimates.
+- Constructor-only temporary initialization consumes the original temporal
+  reader's RNG draws for the mean variant, then retains just norm_v/v_proj/
+  out_proj. Thus every retained tensor, downstream gate, encoder, decoder and
+  common FFN starts identically across the three variants. No trained weights
+  are used for initialization. Temporal and local variants have the same state
+  tensor names/shapes and initialization; checkpoint metadata still rejects
+  loading/resuming one as the other.
+- The new temporal YAML is numerically identical to the existing scheme-1 YAML
+  for initialization, forward output and gradients. Its existing training result
+  can be reused with its ORIGINAL YAML/checkpoint. Do not load an old checkpoint
+  with the new YAML: options differ, and the safety guard correctly rejects it.
+- LocalSTRead(kernel_size=1, num_heads=1, spatial_bias=False) is tested against
+  the original temporal reader for outputs and gradients. The 3x3 implementation
+  is tested against a padded/unfold reference, including invalid border masking.
+- Historical local/dual-expert/GRU modes now also accept explicit stage lists
+  such as [0,1,2]. Their legacy default [2] and original YAML files are preserved
+  for checkpoint compatibility. No additional dual-expert/GRU training YAMLs are
+  added in this change; those architecture experiments remain deferred.
+- Keep FP32, three GPUs 0,2,3, per-GPU batch 1, seed 42, 200 epochs and the existing
+  REBlur data/loss/evaluation protocol. Single-head applies to the reader only;
+  channel CA and encoder SA still use four heads. Do not switch to AMP or alter
+  the batch/crop on just one variant to fit memory.
+
+Run the mean baseline first, then local, after their real three-GPU preflights:
+
+```bash
+tmux new -As reblur_meanv_allscales_3gpu
+conda activate tdc_deblur
+cd ~/projects/TDC_Event_Deblur
+set -o pipefail
+CFG=configs/train_tdc_reblur_mean_v_2ca_allscales_3gpu_scratch.yml
+if CUDA_VISIBLE_DEVICES=0,2,3 torchrun --standalone --nproc_per_node=3 \
+  tools/check_attention_memory.py --config "$CFG" \
+  2>&1 | tee "reblur_meanv_preflight_$(date +%Y%m%d_%H%M%S).log"
+then
+  CUDA_VISIBLE_DEVICES=0,2,3 torchrun --standalone --nproc_per_node=3 \
+    train_ddp.py --config "$CFG" \
+    2>&1 | tee "reblur_meanv_train_$(date +%Y%m%d_%H%M%S).log"
+else
+  echo "Preflight failed; training was not started."
+fi
+```
+
+If already inside tmux, skip tmux new rather than creating a nested session.
+The memory checker does not write model/config files and its smoke test does
+not guarantee every later dataset sample fits. CPU full-size tests are not GPU
+memory measurements. Keep the full training config for future resume/evaluation.
+
+```bash
+python -m unittest discover -s tests -p test_matched_e3_readout.py -v
+TDC_MATCHED_FULL_SIZE_TESTS=1 python -m unittest discover -s tests \
+  -p test_matched_e3_readout.py -k full_resolution -v
+```
+
 ## Experiments and order
 
 | Order | fusion_mode | Stages 0 / 1 / 2 |
@@ -71,8 +165,8 @@ Q/K are not spatially L2-normalized. The content dot product uses sqrt(d) scalin
 Time bias uses [tau,tau^2] through an MLP; its last layer starts at zero. T=1 uses
 tau=0. Attention scores and softmax explicitly disable autocast and use FP32.
 
-LocalSTRead searches the same-scale 3x3 neighborhood across all T, with four
-heads. Total width is max(C/4,8), not that width per head. For C=32/64/128 the
+The historical LocalSTRead config searches a 3x3 neighborhood across all T with
+four heads. Total width is max(C/4,8), not that width per head. For C=32/64/128 the
 total widths are 8/16/32 and head widths 2/4/8. Invalid boundary candidates are
 masked before softmax. Chunk size is 512 query positions; gather happens INSIDE
 each non-reentrant checkpointed chunk during training. Cached indices/masks
@@ -91,7 +185,7 @@ subsequent biased Inject convolution need not output zero for that input.
 Nine offset multiplications avoid a permanently unfolded feature volume, but
 their autograd state is not free. Kernel-head output weights start N(0,0.02).
 
-The GRU runs only at stage 2 with hidden width C/2. Forward/backward cells are
+The historical GRU config runs only at stage 2 with hidden width C/2. Forward/backward cells are
 independent. RGB/E2 context conditions initialization and every update. Original
 time coordinates are retained in reverse scanning. There is no detach/truncated
 BPTT and no extra final spatial gate in this mode.
@@ -103,8 +197,9 @@ fusion outputs, so it is not global statistical independence or disentanglement.
 
 ## Checkpoints and configuration safety
 
-Unknown fusion_options and unsupported MVP kernels/scale policies fail early.
-Only stage 2 is supported for heavy local ST and GRU in this MVP. C/groups and
+Unknown fusion_options and unsupported kernels/scale indices fail early.
+Explicit nonempty, unique stage lists within [0,1,2] are supported for the
+historical local ST and GRU modes; their old YAMLs retain [2]. C/groups and
 projection-width/heads divisibility are checked. E3 supports runtime T>=1, but
 the whole model still needs event_in matching the input E2 channels.
 
@@ -126,6 +221,33 @@ This drops ALL fusions.* source weights, requires exact keys/shapes everywhere
 else, and starts a new optimizer/epoch 0. It never turns resume into partial
 loading and cannot bypass the TDC-versus-Conv3d guard. The five supplied configs
 do not enable this feature.
+
+## Known compatibility limitations and reminder triggers
+
+Recorded on 2026-10-26. The user is already training scheme 1 in FP32 and asks
+to retain these reminders rather than change the current experiment.
+
+1. AMP is not fully supported yet. CPU BF16 autocast reproduces a dtype mismatch
+   in ConditionalTemporalRead: scores disable autocast but TemporalPositionBias
+   receives low-precision q while its MLP weights remain FP32. The current FP32
+   training path is unaffected. Before suggesting AMP, FP16, BF16, GradScaler or
+   a precision change to save memory, raise this limitation and add full-model
+   mixed-precision forward/backward tests, including residual dtype promotion.
+   Do not claim full AMP support after only changing the position-bias input.
+
+2. Checkpoint metadata compares some raw constructor settings rather than fully
+   resolved semantics. Explicit per-branch restormer_channel overrides and omitted
+   overrides inheriting the same global setting produce identical predictions,
+   but metadata validation rejects loading between them. The exact original
+   model YAML works for resume/evaluation. In-memory training validation does
+   not reload a checkpoint and is unaffected. Before creating/simplifying an
+   evaluation config, removing branch overrides, changing inherited defaults or
+   diagnosing a checkpoint-setting mismatch, raise this limitation. A future
+   fix should canonicalize actual resolved settings while retaining strict
+   rejection of genuine architecture/bin/kernel/option mismatches.
+
+Neither issue is evidence that the current FP32 model formula, gradients or
+scores are wrong. No network/precision/config change was made for this reminder.
 
 ## Local verification
 
@@ -150,6 +272,15 @@ Local CPU verification passed 87 regular tests plus the opt-in full-size test:
 all five modes completed two AdamW steps at base_dim=32, T=6, 256x256, followed
 by 260x320 full-frame inference. CUDA, NCCL/DDP training and actual GPU memory
 remain server preflight items; these CPU results are not GPU measurements.
+
+The 2026-10-28 matched-readout update passed the complete 102-test discovery run
+(100 passed, two opt-in tests skipped). Its separate full-size CPU test passed
+two AdamW steps at 256x256 and inference at 260x320 for mean, temporal and local.
+A comparison with pre-update HEAD also verified bitwise-equal initialized state,
+forward output and parameter gradients for all five historical fusion modes.
+The old desktop checkpoint folders were no longer present during this update,
+so trained-checkpoint compatibility was not rechecked against those files;
+strict loading and option rejection were covered by generated-checkpoint tests.
 
 ## Server preflight and first training
 
