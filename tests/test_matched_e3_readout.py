@@ -11,17 +11,24 @@ import yaml
 from models.tdc_deblur_net import build_deblur_model
 from models.temporal_event_fusion import (
     AnchoredLocalSTFusion, ConditionalTemporalRead, ConditionedBiGRUFusion,
-    LocalSTRead, UniformTemporalRead, normalize_fusion_options,
+    IdentityPreservingDualExpertFusion, LocalSTRead, UniformTemporalRead,
+    normalize_fusion_options,
 )
 from utils.model_checkpoint import checkpoint_metadata, fusion_description, load_pretrained_weights
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SLUGS = {"mean": "mean_v_2ca", "temporal": "temporal_2ca", "local": "local_st_2ca"}
+ARCHITECTURE_MODES = ("identity_preserving_dual_expert", "conditioned_bi_gru")
 
 
 def config_for(kind):
     path = ROOT / f"configs/train_tdc_reblur_{SLUGS[kind]}_allscales_3gpu_scratch.yml"
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def architecture_config_for(mode):
+    path = ROOT / f"configs/train_tdc_reblur_{mode}_allscales_3gpu_scratch.yml"
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
@@ -232,6 +239,72 @@ class MatchedReadoutTests(unittest.TestCase):
             out = model(torch.rand(1, 3, 17, 19), torch.randn(1, 6, 17, 19))
             out.square().mean().backward()
             self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters()))
+
+    def test_allscale_architecture_configs_match_protocol_and_preserve_legacy_scope(self):
+        reference = config_for("mean")
+        reference["model"]["fusion_options"].pop("e3_readout")
+        for mode in ARCHITECTURE_MODES:
+            config = architecture_config_for(mode)
+            self.assertIn("AllScales", config["name"])
+            self.assertNotIn("Coarse", config["name"])
+            self.assertEqual(config["model"]["fusion_mode"], mode)
+            config["name"] = reference["name"]
+            config["model"]["fusion_mode"] = reference["model"]["fusion_mode"]
+            self.assertEqual(config, reference)
+            legacy_path = ROOT / f"configs/train_tdc_reblur_{mode}_3gpu_scratch.yml"
+            legacy = yaml.safe_load(legacy_path.read_text(encoding="utf-8"))
+            options = legacy["model"]["fusion_options"]
+            self.assertEqual(options["local_st_scales"], [2])
+            self.assertEqual(options["gru_scales"], [2])
+            self.assertEqual(options["local_st_heads"], 4)
+
+    def test_allscale_architecture_configs_run_every_stage_and_backpropagate(self):
+        classes = {"identity_preserving_dual_expert": IdentityPreservingDualExpertFusion,
+                   "conditioned_bi_gru": ConditionedBiGRUFusion}
+        for length in (6, 16):
+            for mode in ARCHITECTURE_MODES:
+                with self.subTest(mode=mode, length=length):
+                    config = architecture_config_for(mode)["model"]
+                    config.update(base_dim=8, event_in=length)
+                    model = build_deblur_model(**config)
+                    calls, ffn_calls, handles = [], [], []
+                    for i, stage in enumerate(model.fusions):
+                        fusion = stage.temporal_fusion
+                        self.assertIsInstance(fusion, classes[mode])
+                        if mode == "identity_preserving_dual_expert":
+                            self.assertTrue(fusion.use_local)
+                            self.assertEqual(fusion.e3_read.num_heads, 1)
+                            self.assertEqual(fusion.e3_read.kernel_size, 3)
+                            self.assertIsNotNone(fusion.e3_read.spatial_bias)
+                            self.assertFalse(hasattr(fusion, "ca_e3"))
+                        def record_fusion(_, args, i=i):
+                            calls.append((i, args[2].ndim, args[2].shape[2]))
+                        handles.append(fusion.register_forward_pre_hook(record_fusion))
+                        handles.append(stage.ffn.register_forward_hook(lambda _, args, out, i=i: ffn_calls.append(i)))
+                    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0002)
+                    blur, event = torch.rand(1, 3, 17, 19), torch.randn(1, length, 17, 19)
+                    for _ in range(2):
+                        optimizer.zero_grad(set_to_none=True)
+                        output = model(blur, event)
+                        self.assertEqual(output.shape, blur.shape)
+                        output.square().mean().backward()
+                        for key, parameter in model.named_parameters():
+                            self.assertIsNotNone(parameter.grad, (mode, key))
+                            self.assertTrue(torch.isfinite(parameter.grad).all(), (mode, key))
+                        optimizer.step()
+                    self.assertEqual(calls, [(i, 5, length) for i in range(3)] * 2)
+                    self.assertEqual(ffn_calls, [0, 1, 2] * 2)
+                    for handle in handles:
+                        handle.remove()
+                    checkpoint = {"model_state_dict": model.state_dict(), "event3d_conv_type": "tdc",
+                                  **checkpoint_metadata(model, config)}
+                    clone = build_deblur_model(**config)
+                    load_pretrained_weights(clone, checkpoint)
+                    legacy_path = ROOT / f"configs/train_tdc_reblur_{mode}_3gpu_scratch.yml"
+                    legacy = yaml.safe_load(legacy_path.read_text(encoding="utf-8"))["model"]
+                    legacy.update(base_dim=8, event_in=length)
+                    with self.assertRaisesRegex(ValueError, "fusion_options"):
+                        load_pretrained_weights(build_deblur_model(**legacy), checkpoint)
 
     def test_matched_options_reject_accidental_scope_or_head_changes(self):
         options = normalize_fusion_options({"e3_readout": "local"})

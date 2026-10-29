@@ -67,14 +67,14 @@ Inject convolutions, gate, residuals and outer FFN are identical.
   is tested against a padded/unfold reference, including invalid border masking.
 - Historical local/dual-expert/GRU modes now also accept explicit stage lists
   such as [0,1,2]. Their legacy default [2] and original YAML files are preserved
-  for checkpoint compatibility. No additional dual-expert/GRU training YAMLs are
-  added in this change; those architecture experiments remain deferred.
+  for checkpoint compatibility. The new all-scale architecture YAMLs described
+  below are separate from the strictly matched M/T/L readout study.
 - Keep FP32, three GPUs 0,2,3, per-GPU batch 1, seed 42, 200 epochs and the existing
   REBlur data/loss/evaluation protocol. Single-head applies to the reader only;
   channel CA and encoder SA still use four heads. Do not switch to AMP or alter
   the batch/crop on just one variant to fit memory.
 
-Run the mean baseline first, then local, after their real three-GPU preflights:
+Run each selected configuration only after its real three-GPU preflight:
 
 ```bash
 tmux new -As reblur_meanv_allscales_3gpu
@@ -105,7 +105,57 @@ TDC_MATCHED_FULL_SIZE_TESTS=1 python -m unittest discover -s tests \
   -p test_matched_e3_readout.py -k full_resolution -v
 ```
 
-## Experiments and order
+## All-scale dual-expert and GRU architectures (2026-10-29)
+
+| Config under configs/ | Stages 0 / 1 / 2 |
+| --- | --- |
+| train_tdc_reblur_identity_preserving_dual_expert_allscales_3gpu_scratch.yml | dual local expert / dual local expert / dual local expert |
+| train_tdc_reblur_conditioned_bi_gru_allscales_3gpu_scratch.yml | conditional BiGRU / conditional BiGRU / conditional BiGRU |
+
+Both configurations preserve the M/T/L training protocol: REBlur, 6 bins, TDC5,
+all-channel encoder SA and fusion CA, base_dim=32, 200 epochs, learning rate
+0.0002, seed 42, FP32, three GPUs 0,2,3, batch 1 per GPU, train crop 256 and
+903-frame full-image validation every five epochs. Neither loads GoPro weights
+or resumes an earlier run. Their names include AllScales, not Coarse. No old
+configuration or fusion implementation is modified by adding these files.
+
+The dual-expert config explicitly selects local_st_scales=[0,1,2] and one local
+reader head, with widths 8/16/32 and 3x3xT candidates, chunk=512 and checkpoint
+recomputation. The one-head setting aligns with L; it differs from the old
+four-head coarse experiment. Ordinary CA and encoder SA still use four heads.
+The original dual-expert fusion formula is preserved: its E3 expert is queried
+by RGB alone, reads a local memory, then applies Inject directly (no following
+E3 CA); its E2 expert is parallel and their updates are gated separately. Its
+existing learned spatial bias also remains. This is NOT L plus an extra expert,
+and a score difference does not isolate only parallel vs sequential fusion.
+
+The GRU config explicitly selects gru_scales=[0,1,2]. Every stage generates
+context from RGB/E2, runs forward/backward conditioned ConvGRU over the full E3
+time axis, merges their final hidden states, then applies its original two-CA
+fusion. Hidden width remains C/2; no fine stage substitutes temporal attention.
+Its local-reader settings are inactive, not additional local attention.
+
+These two runs are all-scale architecture comparisons against A and M/T/L,
+not parameter-matched single-operator ablations. In particular, do not describe
+dual-expert vs L as isolating just the number of experts. Keep the exact new
+YAML for saving, evaluation and resume; old Coarse checkpoints are incompatible.
+Suggested order after the current M run: dual-expert, then conditional BiGRU.
+Use the preflight/train command above with the corresponding CFG. Never reduce
+the active stage list automatically to make a GPU fit; inspect a failed preflight
+first. Full-frame validation uses the training validation protocol directly, so
+a separate tiled/full-image evaluation configuration is not required for REBlur.
+
+Validation for the two new YAMLs (2026-10-29): the CPU suite ran 104 tests,
+102 passed and two existing opt-in tests were skipped. Config tests check the
+same protocol as M, preserved old coarse YAMLs, full-5D E3 at every stage,
+6/16-bin forward/backward, all parameter gradients, checkpoint round trips and
+rejection of cross-loading the new all-scale checkpoint into the old coarse
+configuration. Separate CPU checks of both exact base_dim=32/event_in=6 configs
+completed two AdamW steps at 256x256 and full-frame 260x320 inference with finite
+outputs and gradients. Parameter counts: dual expert=2,884,856; GRU=3,871,112.
+These synthetic CPU checks do not measure GPU memory or validate CUDA/NCCL.
+
+## Historical experiments and order
 
 | Order | fusion_mode | Stages 0 / 1 / 2 |
 | --- | --- | --- |
