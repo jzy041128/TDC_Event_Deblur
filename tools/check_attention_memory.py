@@ -46,6 +46,27 @@ def finish_preflight(device, world_size):
         print(f"Preflight PASS: checks and synchronized shutdown complete; world_size={world_size}.", flush=True)
 
 
+def check_validation(config, model, device, val_samples):
+    val_opt = dict(config["datasets"]["val"], split="val", random_crop=False)
+    patch_size = val_opt.get("patch_size", 256)
+    label = "Complete-image validation" if patch_size is None else "Center-crop validation"
+    print(f"Validation mode: {label}; configured patch_size={patch_size}")
+    val_dataset = build_dataset(val_opt)
+    if len(val_dataset) == 0:
+        raise ValueError("Validation dataset is empty.")
+    torch.cuda.reset_peak_memory_stats(device)
+    model.eval()
+    with torch.no_grad():
+        for index in range(min(val_samples, len(val_dataset))):
+            sample = val_dataset[index]
+            blur = sample["blur"].unsqueeze(0).to(device)
+            event = sample["event"].unsqueeze(0).to(device)
+            pred = model(blur, event)
+            print(f"Validation {index}: blur={tuple(blur.shape)}, event={tuple(event.shape)}")
+            del pred, blur, event
+    report_peak(label, device)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Check single-GPU or torchrun DDP memory without saving experiment files.")
     parser.add_argument("--config", required=True)
@@ -121,26 +142,19 @@ def main():
     del batch
     optimizer.zero_grad(set_to_none=True)
 
-    val_opt = dict(config["datasets"]["val"], split="val", random_crop=False)
-    if val_opt.get("patch_size") is not None:
-        parser.error("Set validation patch_size: null to check complete images.")
-    val_dataset = build_dataset(val_opt)
-    if len(val_dataset) == 0:
-        parser.error("Validation dataset is empty.")
-    torch.cuda.reset_peak_memory_stats(device)
-    raw_model.eval()
-    with torch.no_grad():
-        for index in range(min(args.val_samples, len(val_dataset))):
-            sample = val_dataset[index]
-            blur = sample["blur"].unsqueeze(0).to(device)
-            event = sample["event"].unsqueeze(0).to(device)
-            pred = raw_model(blur, event)
-            print(f"Validation {index}: blur={tuple(blur.shape)}, event={tuple(event.shape)}")
-            del pred, blur, event
-    report_peak("Complete-image validation", device)
+    check_validation(config, raw_model, device, args.val_samples)
     print(f"No checkpoint/config written. DDP world_size={world_size}; unsampled image shapes are not covered.")
     finish_preflight(device, world_size)
 
 
+def run_preflight():
+    try:
+        main()
+    finally:
+        if dist.is_initialized():
+            # An error on one rank must not wait for a new collective barrier.
+            dist.destroy_process_group()
+
+
 if __name__ == "__main__":
-    main()
+    run_preflight()

@@ -73,3 +73,28 @@ three existing/opt-in tests skipped). The separate opt-in standard-size test
 also passed: two 256x256 AdamW steps and tiled 260x320 inference with all
 2,980,846 parameters in the exact 16-bin model. No server was contacted or
 server training job launched; no GPU memory or communication result is claimed.
+
+## Preflight crop compatibility fix (2026-10-30)
+
+The initial five-GPU server log completed training memory measurement but then
+failed because the preflight tool required validation patch_size=null. This was
+a checker restriction, not an out-of-memory result. The EVRB training YAMLs
+correctly retain patch_size=256 for comparable center-crop validation; do not
+change them to null just to bypass the checker. The tool now checks validation
+at the configured size, reports Center-crop validation vs Complete-image
+validation explicitly, and cleans up an initialized process group on errors
+without printing Preflight PASS or attempting another collective barrier.
+
+The user-provided log measured five-rank FP32 training peak allocated=8.052 GiB,
+reserved=9.549 GiB, synchronized step time=2.3142 s with three warmup and three
+measured steps. These cover only the completed train portion of that preflight;
+validation and normal synchronized shutdown had not passed, and no formal
+training startup is present in the supplied log. Rerun the full preflight after
+pulling the fix; do not infer 400-epoch stability from those memory values.
+
+Fix verification: 115 CPU tests ran, 112 passed and three opt-in tests were
+skipped. New tests use the actual three-/five-GPU EVRB YAMLs to check cropped
+validation and the REBlur YAML to check full-image validation, with CUDA memory
+calls mocked. They also check sample limits, no config mutation, empty datasets,
+error cleanup without a barrier/PASS, and no double process-group destruction.
+No new CUDA/DDP run was performed locally or on the server.
