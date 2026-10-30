@@ -1,0 +1,61 @@
+name: LocalST2CA_EVRB_16bin_TDC5_AllScales_FullResolution_Eval
+
+model:
+  type: progressive_fusion
+  rgb_in: 3
+  event_in: 16
+  base_dim: 32
+  fusion_mode: cond_temporal_2ca
+  fusion_dim: 2d
+  cross_attn_type: channel
+  swapped_kv_order: event3d_first
+  encoder_self_attn: restormer_channel
+  encoder_self_attn_rgb: restormer_channel
+  encoder_self_attn_event2d: restormer_channel
+  encoder_self_attn_event3d: restormer_channel
+  self_attn_window_size: 8
+  cross_attn_window_size: 8
+  temporal_window_size: 2
+  event3d_conv_type: tdc
+  tdc_kernel_size: 5
+  num_heads: 4
+  qk_norm: false
+  gamma_init: 0.1
+  deform_alignment: none
+  decoder_block: plain
+  decoder_attention: none
+  two_stage: false
+  sam_mode: none
+  refine_type: shallow
+  fusion_options:
+    e3_readout: local
+    temporal_reduction: 4
+    temporal_min_dim: 8
+    temporal_position: quadratic_mlp
+    gate_reduction: 4
+    gate_min_dim: 8
+    dynamic_groups: 4
+    dynamic_kernel_size: 3
+    dynamic_kernel_gain: 1.0
+    local_st_scales: [0, 1, 2]
+    local_st_heads: 1
+    local_st_reduction: 4
+    local_st_min_dim: 8
+    local_st_kernel_size: 3
+    local_st_query_chunk: 512
+    local_st_checkpoint_chunks: true
+    gru_scales: [0, 1, 2]
+    gru_hidden_ratio: 0.5
+
+datasets:
+  val:
+    dataset_type: evrb
+    dataroot: /data1/jzy/datasets/EVRB/test
+    event_bins: 16
+    patch_size: null
+    norm_event: true
+    num_workers: 0
+
+train:
+  seed: 42
+  deterministic: true
