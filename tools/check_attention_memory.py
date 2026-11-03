@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import json
 import os
 import sys
 import time
@@ -33,6 +35,28 @@ def report_peak(label, device):
         torch.cuda.synchronize(device)
         if dist.get_rank() == 0:
             print(f"{label}: max across ranks allocated={peaks[0].item():.3f} GiB, reserved={peaks[1].item():.3f} GiB")
+        allocated, reserved = peaks.tolist()
+    return {"allocated_gib": allocated, "reserved_gib": reserved}
+
+
+def max_step_seconds(durations, device):
+    value = sum(durations) / len(durations)
+    if dist.is_initialized():
+        timing = torch.tensor([value], device=device)
+        dist.all_reduce(timing, op=dist.ReduceOp.MAX)
+        torch.cuda.synchronize(device)
+        value = timing.item()
+    return value
+
+
+def write_result(path, result):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("x", encoding="utf-8") as stream:
+        json.dump(result, stream, indent=2, ensure_ascii=False, allow_nan=False)
+        stream.write("\n")
+    os.replace(temporary, path)
 
 
 def finish_preflight(device, world_size):
@@ -56,15 +80,18 @@ def check_validation(config, model, device, val_samples):
         raise ValueError("Validation dataset is empty.")
     torch.cuda.reset_peak_memory_stats(device)
     model.eval()
+    shapes = []
     with torch.no_grad():
         for index in range(min(val_samples, len(val_dataset))):
             sample = val_dataset[index]
             blur = sample["blur"].unsqueeze(0).to(device)
             event = sample["event"].unsqueeze(0).to(device)
             pred = model(blur, event)
+            shapes.append({"blur": list(blur.shape), "event": list(event.shape)})
             print(f"Validation {index}: blur={tuple(blur.shape)}, event={tuple(event.shape)}")
             del pred, blur, event
-    report_peak(label, device)
+    return {"mode": label, "patch_size": patch_size, "dataset_samples": len(val_dataset), "samples_checked": len(shapes),
+            "shapes": shapes, **report_peak(label, device)}
 
 
 def main():
@@ -73,6 +100,7 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=3)
     parser.add_argument("--train-steps", type=int, default=3)
     parser.add_argument("--val-samples", type=int, default=3)
+    parser.add_argument("--result-json", help="Write rank-zero structured metrics only after successful synchronized shutdown.")
     args = parser.parse_args()
     if args.warmup_steps < 3 or args.train_steps < 2 or args.val_samples < 1:
         parser.error("Use at least three warmup steps, two measured train steps and one validation sample.")
@@ -137,14 +165,30 @@ def main():
         train_step()
         torch.cuda.synchronize(device)
         durations.append(time.perf_counter() - started)
-    report_peak("Train (forward/backward/AdamW)", device)
+    train_metrics = report_peak("Train (forward/backward/AdamW)", device)
+    train_metrics.update(batch_shapes={key: list(value.shape) for key, value in batch.items()},
+                         step_seconds_max=max_step_seconds(durations, device))
     print(f"Rank {rank}: mean measured train step={sum(durations) / len(durations):.4f} s ({args.train_steps} steps after {args.warmup_steps} warmup)")
     del batch
     optimizer.zero_grad(set_to_none=True)
 
-    check_validation(config, raw_model, device, args.val_samples)
+    validation_metrics = check_validation(config, raw_model, device, args.val_samples)
     print(f"No checkpoint/config written. DDP world_size={world_size}; unsampled image shapes are not covered.")
     finish_preflight(device, world_size)
+    if rank == 0 and args.result_json:
+        write_result(args.result_json, {
+            "schema": "attention_memory.v1", "status": "pass", "world_size": world_size,
+            "config": str(Path(args.config).resolve()),
+            "config_sha256": hashlib.sha256(Path(args.config).read_bytes()).hexdigest(),
+            "model_config": config["model"], "precision": "float32",
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            "parameters": sum(p.numel() for p in raw_model.parameters()),
+            "weights": "fresh initialization; no checkpoint loaded or saved",
+            "per_gpu_batch": train_opt.get("batch_size", 1), "train_dataloader_workers": 0,
+            "train_samples": len(train_dataset),
+            "warmup_steps": args.warmup_steps, "measured_steps": args.train_steps,
+            "train": train_metrics, "validation": validation_metrics,
+        })
 
 
 def run_preflight():

@@ -1,0 +1,37 @@
+schema: reblur_fusion_memory.v1
+experiments:
+  - id: gate4ca
+    directory: Seed42_RGBGatedEventThenRGB4CA_EncoderRestormerChannelSA_REBlur_3GPU_FromScratch_200ep_20261024_015631
+    fusion_mode: rgb_gated_event_then_rgb_4ca
+    original_world_size: 3
+  - id: mean_v
+    directory: Seed42_MeanV2CA_EncoderRestormerChannelSA_REBlur_6bin_TDC5_AllScales_3GPU_FromScratch_200ep_20261029_122314
+    fusion_mode: cond_temporal_2ca
+    readout: mean
+    original_world_size: 3
+  - id: temporal
+    directory: Seed42_ConditionalTemporal2CA_EncoderRestormerChannelSA_REBlur_6bin_TDC5_3GPU_FromScratch_200ep_20261026_164306
+    fusion_mode: cond_temporal_2ca
+    readout: temporal
+    original_world_size: 3
+  - id: local_st
+    directory: Seed42_LocalST2CA_EncoderRestormerChannelSA_REBlur_6bin_TDC5_AllScales_3GPU_FromScratch_200ep_20261028_212124
+    fusion_mode: cond_temporal_2ca
+    readout: local
+    original_world_size: 3
+  - id: dual_expert
+    directory: Seed42_IdentityDualExpertLocalST_EncoderRestormerChannelSA_REBlur_6bin_TDC5_AllScales_3GPU_FromScratch_200ep_20261029_203332
+    fusion_mode: identity_preserving_dual_expert
+    original_world_size: 3
+  - id: bi_gru
+    directory: Seed42_ConditionedBiGRU_EncoderRestormerChannelSA_REBlur_6bin_TDC5_AllScales_3GPU_FromScratch_200ep_20261030_122352
+    fusion_mode: conditioned_bi_gru
+    original_world_size: 3
+  - id: dynamic_filter
+    directory: Seed42_EventControlledDynamicFilter_EncoderRestormerChannelSA_REBlur_6bin_TDC5_3GPU_FromScratch_200ep_20261027_210211
+    fusion_mode: event_controlled_dynamic_filter
+    original_world_size: 3
+  - id: direct2ca
+    directory: Seed42_DirectEventToRGB2CA_EncoderRestormerChannelSA_REBlur_5GPU_FromScratch_200ep_20261010_200119
+    fusion_mode: direct_event_to_rgb_2ca
+    original_world_size: 5

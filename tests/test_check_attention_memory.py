@@ -1,4 +1,6 @@
 import copy
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -10,6 +12,31 @@ from tools import check_attention_memory as memory
 
 
 class AttentionMemoryShutdownTests(unittest.TestCase):
+    def test_structured_peak_values_are_returned(self):
+        with patch.object(memory.dist, 'is_initialized', return_value=False), \
+                patch.object(memory.torch.cuda, 'synchronize'), \
+                patch.object(memory.torch.cuda, 'max_memory_allocated', return_value=4 * 2**30), \
+                patch.object(memory.torch.cuda, 'max_memory_reserved', return_value=5 * 2**30), patch('builtins.print'):
+            self.assertEqual(memory.report_peak('test', torch.device('cpu')), {'allocated_gib': 4, 'reserved_gib': 5})
+
+    def test_machine_result_json_is_atomic_and_contains_full_precision(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'metrics.json'
+            result = {'status': 'pass', 'train': {'allocated_gib': 3.99512345}}
+            memory.write_result(path, result)
+            self.assertEqual(json.loads(path.read_text()), result)
+            self.assertFalse(path.with_name(path.name + '.tmp').exists())
+
+    def test_step_time_uses_slowest_rank(self):
+        value = torch.tensor([1.4])
+        with patch.object(memory.dist, 'is_initialized', return_value=True), \
+                patch.object(memory.torch, 'tensor', return_value=value), \
+                patch.object(memory.dist, 'all_reduce') as reduce, \
+                patch.object(memory.torch.cuda, 'synchronize') as sync:
+            self.assertAlmostEqual(memory.max_step_seconds([0.5, 0.7], torch.device('cpu')), 1.4, places=5)
+            reduce.assert_called_once_with(value, op=memory.dist.ReduceOp.MAX)
+            sync.assert_called_once()
+
     def test_report_waits_for_cuda_collective_on_every_rank(self):
         for rank in (0, 1, 2):
             events = []
