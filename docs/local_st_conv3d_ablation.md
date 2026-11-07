@@ -4,8 +4,8 @@
 
 The existing implementation already supports `event3d_conv_type: conv3d` for
 all E3 stages. No network or trainer rewrite is needed. Keep the TDC path and
-all old configurations unchanged. Only EVRB training and full-image evaluation
-YAMLs are added for now; other datasets can reuse this architecture later.
+all old configurations unchanged. This group has EVRB, REBlur, GoPro, and REVD
+configs. All use the same fusion mechanism and ordinary Conv3d at each scale.
 
 - Train: configs/train_tdc_evrb_16bin_local_st_2ca_conv3d5_allscales_5gpu_scratch.yml
 - Evaluate: configs/eval_tdc_evrb_16bin_local_st_2ca_conv3d5_allscales_full.yml
@@ -57,6 +57,33 @@ images and evaluate_ddp.py --full-resolution --tile-size 256 --tile-overlap 32.
 The train/evaluation model dictionaries are exactly equal, including explicit
 branch SA overrides and fusion_options, for strict checkpoint compatibility.
 
+## Follow-up Runs
+
+1. REBlur: use `configs/train_tdc_reblur_6bin_local_st_2ca_conv3d5_allscales_3gpu_scratch.yml`
+   with physical GPUs 0,2,3. It matches the existing L+TDC REBlur configuration
+   except for convolution mode, name, and output root. Use 6 bins, global batch 3,
+   200 epochs from scratch, seed 42, and all 903 complete validation frames
+   every five epochs. A separate full-image evaluation YAML is unnecessary.
+2. GoPro: use `configs/train_tdc_gopro_6bin_local_st_2ca_conv3d5_allscales_5gpu_scratch.yml`.
+   Keep the prior GoPro six-bin server voxels, five ranks, per-rank batch 1,
+   600 epochs, lr=0.0002, 256x256 crops, and validation every epoch. The paired
+   `configs/eval_tdc_gopro_6bin_local_st_2ca_conv3d5_allscales_full.yml`
+   disables the validation crop without changing the model.
+3. REVD: use `configs/train_tdc_revd_6bin_local_st_2ca_conv3d5_allscales_5gpu_finetune.yml`
+   only after GoPro L+Conv3d is trained. Set path.pretrain_model to that run's
+   actual best.pth and leave path.resume_state null. The template deliberately
+   names a nonexistent checkpoint until filled in, so it cannot silently run
+   from scratch. Keep the existing six-bin trilinear caches, five ranks,
+   200 epochs, lr=0.00002, and validation every five epochs. The matching
+   `configs/eval_tdc_revd_6bin_local_st_2ca_conv3d5_allscales_full.yml`
+   evaluates the uncropped test set. GoPro and REVD model dictionaries match
+   exactly so full-weight initialization can use strict loading.
+
+REBlur and EVRB already have matched L+TDC controls. The earlier GoPro and REVD
+4CA/2CA runs use different fusion architectures and are historical references,
+not controls that isolate TDC versus Conv3d. This follow-up does not add new
+GoPro L+TDC or REVD L+TDC training runs.
+
 ## Grouped Experiment Output
 
 The new YAML sets:
@@ -84,7 +111,7 @@ and distinct dataset/bin/budget/seed experiment names, for example:
     Seed42_LocalST2CA_..._REVD_..._TIMESTAMP/
 ```
 
-The REBlur/GoPro/REVD lines describe future runs, not configurations added now.
+The REBlur/GoPro/REVD lines describe the layout of future run directories.
 Old experiments are neither moved nor renamed. In particular, old absolute
 resume and pretraining paths continue to work. On resume, the existing trainer
 uses the directory containing latest.pth, irrespective of experiments_root.
@@ -112,3 +139,6 @@ existing trainer grouping and resume behavior, plain convolution in every E3
 block, all-scale full-time local-read/CA hooks and finite AdamW updates for
 6/16 bins, parameter counts and seeded initial weights, and Conv3d checkpoint
 roundtrip plus tiled evaluation and rejection of TDC checkpoints.
+The follow-up tests also compare the REBlur configuration against the existing
+matched control, keep GoPro/REVD dataset protocols unchanged, check both full
+image configurations, and load a matching GoPro checkpoint into the REVD model.

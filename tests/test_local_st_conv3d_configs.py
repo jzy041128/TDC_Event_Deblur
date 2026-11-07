@@ -20,6 +20,9 @@ TRAIN = 'train_tdc_evrb_16bin_local_st_2ca_conv3d5_allscales_5gpu_scratch.yml'
 EVAL = 'eval_tdc_evrb_16bin_local_st_2ca_conv3d5_allscales_full.yml'
 BASELINE = 'train_tdc_evrb_16bin_local_st_2ca_allscales_5gpu_scratch.yml'
 GROUP = 'LocalST2CA_Conv3d5_AllScales'
+REBLUR = 'train_tdc_reblur_6bin_local_st_2ca_conv3d5_allscales_3gpu_scratch.yml'
+GOPRO = 'train_tdc_gopro_6bin_local_st_2ca_conv3d5_allscales_5gpu_scratch.yml'
+REVD = 'train_tdc_revd_6bin_local_st_2ca_conv3d5_allscales_5gpu_finetune.yml'
 
 
 def config(filename):
@@ -50,6 +53,62 @@ class LocalSTConv3dConfigTests(unittest.TestCase):
         val['patch_size'] = None
         self.assertEqual(val, evaluation['datasets']['val'])
         self.assertEqual(evaluation['train'], {'seed': 42, 'deterministic': True})
+
+    def test_reblur_preserves_the_existing_three_gpu_tdc_protocol(self):
+        plain = config(REBLUR)
+        tdc = config('train_tdc_reblur_local_st_2ca_allscales_3gpu_scratch.yml')
+        self.assertIn('3GPU_FromScratch_200ep', plain['name'])
+        self.assertEqual(plain['model']['event3d_conv_type'], 'conv3d')
+        self.assertIsNone(plain['datasets']['val']['patch_size'])
+        self.assertEqual(plain['path']['experiments_root'], '/data1/jzy/experiments/' + GROUP)
+        plain['name'] = tdc['name']
+        plain['model']['event3d_conv_type'] = 'tdc'
+        plain['path']['experiments_root'] = tdc['path']['experiments_root']
+        self.assertEqual(plain, tdc)
+
+    def test_followup_models_match_and_keep_dataset_specific_training_settings(self):
+        expected_model = config(TRAIN)['model']
+        expected_model['event_in'] = 6
+        # The archived REBlur configuration relies on the default rgb_in=3.
+        self.assertEqual(expected_model.pop('rgb_in'), 3)
+        for filename in (REBLUR, GOPRO, REVD):
+            cfg = config(filename)
+            self.assertEqual(cfg['model'], expected_model, filename)
+            self.assertEqual(cfg['path']['experiments_root'], '/data1/jzy/experiments/' + GROUP)
+            self.assertIsNone(cfg['path']['resume_state'])
+        gopro = config(GOPRO)
+        revd = config(REVD)
+        for candidate, reference in (
+            (gopro, config('train_tdc_gopro_rgb_gated4ca_conv3d_scratch.yml')),
+            (revd, config('train_tdc_revd_finetune.yml')),
+        ):
+            for field in ('datasets', 'loss', 'train'):
+                self.assertEqual(candidate[field], reference[field], field)
+        self.assertIsNone(gopro['path']['pretrain_model'])
+        self.assertEqual(revd['path']['pretrain_model'], '/data1/jzy/experiments/' + GROUP
+                         + '/REPLACE_WITH_GOPRO_L_CONV3D5_RUN/best.pth')
+
+    def test_gopro_and_revd_full_image_configs_keep_exact_models(self):
+        for train_name, dataset in ((GOPRO, 'gopro'), (REVD, 'revd')):
+            train = config(train_name)
+            evaluation = config(f'eval_tdc_{dataset}_6bin_local_st_2ca_conv3d5_allscales_full.yml')
+            self.assertEqual(evaluation['model'], train['model'])
+            val = copy.deepcopy(train['datasets']['val'])
+            val['patch_size'] = None
+            self.assertEqual(evaluation['datasets'], {'val': val})
+            self.assertEqual(evaluation['train'], {'seed': 42, 'deterministic': True})
+
+    def test_revd_accepts_the_matching_gopro_checkpoint_strictly(self):
+        gopro = config(GOPRO)['model']
+        revd = config(REVD)['model']
+        gopro['base_dim'] = revd['base_dim'] = 8
+        source = build_deblur_model(**gopro)
+        checkpoint = {'model_state_dict': source.state_dict(), 'event3d_conv_type': 'conv3d',
+                      **checkpoint_metadata(source, gopro)}
+        target = build_deblur_model(**revd)
+        load_pretrained_weights(target, checkpoint)
+        for name, tensor in source.state_dict().items():
+            torch.testing.assert_close(target.state_dict()[name], tensor, rtol=0, atol=0)
 
     def test_original_trainer_creates_group_and_keeps_resume_in_original_run(self):
         with tempfile.TemporaryDirectory() as root:
