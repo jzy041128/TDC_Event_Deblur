@@ -10,7 +10,7 @@ import yaml
 
 from models.tdc_deblur_net import build_deblur_model
 from models.temporal_event_fusion import (
-    AnchoredLocalSTFusion, ConditionalTemporalRead, ConditionedBiGRUFusion,
+    AnchoredLocalSTFusion, ConditionalSpatialRead, ConditionalTemporalRead, ConditionedBiGRUFusion,
     IdentityPreservingDualExpertFusion, LocalSTRead, UniformTemporalRead,
     normalize_fusion_options,
 )
@@ -18,7 +18,8 @@ from utils.model_checkpoint import checkpoint_metadata, fusion_description, load
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SLUGS = {"mean": "mean_v_2ca", "temporal": "temporal_2ca", "local": "local_st_2ca"}
+SLUGS = {"mean": "mean_v_2ca", "temporal": "temporal_2ca", "local": "local_st_2ca",
+         "spatial": "spatial_2ca"}
 ARCHITECTURE_MODES = ("identity_preserving_dual_expert", "conditioned_bi_gru")
 
 
@@ -77,9 +78,10 @@ class MatchedReadoutTests(unittest.TestCase):
             torch.manual_seed(42)
             temporal = ConditionalTemporalRead(channels, channels * 2)
             expected_rng = torch.get_rng_state()
-            for kind in ("mean", "local"):
+            for kind in ("mean", "local", "spatial"):
                 torch.manual_seed(42)
-                reader = (UniformTemporalRead(channels, channels * 2) if kind == "mean" else
+                factories = {"mean": UniformTemporalRead, "spatial": ConditionalSpatialRead}
+                reader = (factories[kind](channels, channels * 2) if kind in factories else
                           LocalSTRead(channels, channels * 2, num_heads=1, spatial_bias=False))
                 self.assertTrue(torch.equal(torch.get_rng_state(), expected_rng))
                 for key, value in reader.state_dict().items():
@@ -166,7 +168,8 @@ class MatchedReadoutTests(unittest.TestCase):
                     torch.testing.assert_close(p.grad, q.grad, atol=0, rtol=0, msg=key)
 
     def test_complete_models_use_selected_reader_all_stages_and_have_no_unused_parameters(self):
-        reader_types = {"mean": UniformTemporalRead, "temporal": ConditionalTemporalRead, "local": LocalSTRead}
+        reader_types = {"mean": UniformTemporalRead, "temporal": ConditionalTemporalRead,
+                        "local": LocalSTRead, "spatial": ConditionalSpatialRead}
         for length in (6, 16):
             for kind in SLUGS:
                 config = config_for(kind)
@@ -181,7 +184,7 @@ class MatchedReadoutTests(unittest.TestCase):
                         e3_shapes.append(tuple(args[1].shape))
                     handles.append(stage.temporal_fusion.temporal_read.register_forward_pre_hook(record_reader))
                     handles.append(stage.ffn.register_forward_hook(lambda _, args, out, i=i: ffn_calls.append(i)))
-                    if kind == "local":
+                    if kind in ("local", "spatial"):
                         reader = stage.temporal_fusion.temporal_read
                         self.assertEqual(reader.num_heads, 1)
                         self.assertEqual(reader.kernel_size, 3)
@@ -207,6 +210,9 @@ class MatchedReadoutTests(unittest.TestCase):
                     self.assertIn("V-only widths", description)
                     self.assertIn("no RGB/E2-conditioned weights", description)
                 if kind == "local":
+                    self.assertIn("actual local stages=[0, 1, 2]", description)
+                if kind == "spatial":
+                    self.assertIn("per-frame spatial softmax, uniform temporal mean (1/T)", description)
                     self.assertIn("actual local stages=[0, 1, 2]", description)
 
     def test_checkpoint_roundtrip_and_cross_readout_rejection(self):
@@ -319,7 +325,7 @@ class MatchedReadoutTests(unittest.TestCase):
             build_deblur_model(base_dim=8, fusion_mode="conditioned_bi_gru", fusion_options={"e3_readout": "mean"})
 
     @unittest.skipUnless(os.environ.get("TDC_MATCHED_FULL_SIZE_TESTS") == "1", "Opt-in full-resolution CPU synthetic check")
-    def test_full_resolution_two_steps_and_full_frame_all_three_readouts(self):
+    def test_full_resolution_two_steps_and_full_frame_all_readouts(self):
         self.addCleanup(torch.use_deterministic_algorithms, torch.are_deterministic_algorithms_enabled())
         torch.use_deterministic_algorithms(True)
         for kind in SLUGS:

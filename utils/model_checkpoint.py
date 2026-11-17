@@ -52,21 +52,24 @@ def fusion_description(model):
     temporal_widths = [max(c // opt["temporal_reduction"], opt["temporal_min_dim"]) for c in dims]
     local_widths = [max(c // opt["local_st_reduction"], opt["local_st_min_dim"]) for c in dims]
     local_stages = [i for i, stage in enumerate(model.fusions)
-                    if any(type(module).__name__ == "LocalSTRead" for module in stage.temporal_fusion.modules())]
+                    if any(type(module).__name__ in {"LocalSTRead", "ConditionalSpatialRead"}
+                           for module in stage.temporal_fusion.modules())]
     readers = [[type(module).__name__ for module in stage.temporal_fusion.modules()
-                if type(module).__name__ in {"ConditionalTemporalRead", "UniformTemporalRead", "LocalSTRead"}]
+                if type(module).__name__ in {"ConditionalTemporalRead", "UniformTemporalRead", "LocalSTRead", "ConditionalSpatialRead"}]
                for stage in model.fusions]
     local_details = [
         {"stage": i, "heads": module.num_heads, "width": module.width,
          "kernel": module.kernel_size, "spatial_bias": module.spatial_bias is not None}
         for i, stage in enumerate(model.fusions) for module in stage.temporal_fusion.modules()
-        if type(module).__name__ == "LocalSTRead"
+        if type(module).__name__ in {"LocalSTRead", "ConditionalSpatialRead"}
     ]
-    readout_note = (
-        "uniform mean of normed/projected V, no RGB/E2-conditioned weights"
-        if opt.get("e3_readout") == "mean" else "conditional attention"
-    )
+    readout_note = {
+        "mean": "uniform mean of normed/projected V, no RGB/E2-conditioned weights",
+        "spatial": "per-frame spatial softmax, uniform temporal mean (1/T), no learned time bias",
+    }.get(opt.get("e3_readout"), "conditional attention")
     projection_label = "V-only widths" if opt.get("e3_readout") == "mean" else "temporal Q/K/V widths"
+    if opt.get("e3_readout") == "spatial":
+        projection_label = "spatial Q/K/V widths"
     return (
         f"Temporal fusion stages: {stages} | E3 input: full 5D, no pre-fusion temporal mean | "
         f"readers by stage={readers} | readout={readout_note} | "

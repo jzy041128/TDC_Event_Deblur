@@ -28,7 +28,7 @@ fusion_dim=2d specifies the output, not the input E3 dimensionality.
 
 ## Matched all-scale readout study
 
-All three configurations use fusion_mode=cond_temporal_2ca, with an explicit
+All four configurations use fusion_mode=cond_temporal_2ca, with an explicit
 fusion_options.e3_readout switch. Only the experiment name and this switch
 differ between their YAML files. Each selected reader runs at stages 0, 1 and 2;
 no stage falls back to another reader. The common RGB/E2 CA, subsequent E3 CA,
@@ -39,6 +39,7 @@ Inject convolutions, gate, residuals and outer FFN are identical.
 | mean | train_tdc_reblur_mean_v_2ca_allscales_3gpu_scratch.yml | UniformTemporalRead: mean of normalized/projected V, followed by out_proj |
 | temporal | train_tdc_reblur_temporal_2ca_allscales_3gpu_scratch.yml | Original single-head ConditionalTemporalRead |
 | local | train_tdc_reblur_local_st_2ca_allscales_3gpu_scratch.yml | Single-head LocalSTRead, 3x3 neighborhood, followed by the same E3 CA |
+| spatial | train_tdc_reblur_spatial_2ca_allscales_3gpu_scratch.yml | Single-head ConditionalSpatialRead: per-frame 3x3 spatial softmax, then uniform temporal mean |
 
 - Q/K/V widths are 8/16/32 at C=32/64/128. The mean reader keeps V/out_proj only;
   it neither calculates Q/K nor registers unused Q/K or time-bias parameters.
@@ -49,12 +50,23 @@ Inject convolutions, gate, residuals and outer FFN are identical.
   additional learned spatial bias, so enlarging 1x1 to 3x3 adds candidates rather
   than another positional parameter family. Existing four-head local modes keep
   their original learned spatial bias and formulas.
-- At base_dim=32/event_in=6 the parameter counts are mean=2,960,299 and
-  temporal=local=2,977,966. These are parameter counts, not GPU-memory estimates.
+- S uses the same local candidate gathering, Q/K/V/out projections, boundary
+  mask, query chunks and activation checkpointing as L. It normalizes nine spatial
+  scores separately in each frame, then assigns exactly 1/T total weight to each
+  frame. It never averages raw E3 before conditional spatial reading.
+- A scalar time bias shared by all nine candidates cancels in a per-frame
+  softmax. S consumes the same constructor RNG draws as L, then removes that
+  unused MLP to avoid dead parameters with DDP find_unused_parameters=False.
+  The existing temporal_position config field is retained for YAML matching but
+  does not create a time bias in S. S has no learned spatial bias either.
+- At base_dim=32/event_in=6 the parameter counts are mean=2,960,299,
+  temporal=local=2,977,966 and spatial=2,977,771. S removes 65 time-bias parameters
+  per stage (195 total); this is not strictly equal parameter count. These are
+  parameter counts, not GPU-memory estimates.
 - Constructor-only temporary initialization consumes the original temporal
   reader's RNG draws for the mean variant, then retains just norm_v/v_proj/
   out_proj. Thus every retained tensor, downstream gate, encoder, decoder and
-  common FFN starts identically across the three variants. No trained weights
+  common FFN starts identically across the four variants. No trained weights
   are used for initialization. Temporal and local variants have the same state
   tensor names/shapes and initialization; checkpoint metadata still rejects
   loading/resuming one as the other.
@@ -101,9 +113,15 @@ memory measurements. Keep the full training config for future resume/evaluation.
 
 ```bash
 python -m unittest discover -s tests -p test_matched_e3_readout.py -v
+python -m unittest discover -s tests -p test_spatial_e3_readout.py -v
 TDC_MATCHED_FULL_SIZE_TESTS=1 python -m unittest discover -s tests \
   -p test_matched_e3_readout.py -k full_resolution -v
 ```
+
+S was added on 2026-11-17. See `reblur_spatial_readout_handoff.md` for the old-server
+launch procedure and new-server migration handoff. Existing M/T/L YAMLs and
+checkpoint keys/options remain unchanged; S cannot resume a checkpoint from a
+different readout type.
 
 ## All-scale dual-expert and GRU architectures (2026-10-29)
 

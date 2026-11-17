@@ -57,8 +57,8 @@ def normalize_fusion_options(options=None):
                 or len(set(scales)) != len(scales)):
             raise ValueError(f"fusion_options.{key} must contain unique stage indices from 0, 1, 2")
     if "e3_readout" in result:
-        if result["e3_readout"] not in ("mean", "temporal", "local"):
-            raise ValueError("fusion_options.e3_readout must be mean, temporal or local")
+        if result["e3_readout"] not in ("mean", "temporal", "local", "spatial"):
+            raise ValueError("fusion_options.e3_readout must be mean, temporal, local or spatial")
         # New matched experiments are all-scale and single-head; legacy defaults stay unchanged.
         if "local_st_heads" not in (options or {}):
             result["local_st_heads"] = 1
@@ -235,6 +235,12 @@ class LocalSTRead(_ProjectedReader):
             self._neighbor_cache = (key, index, valid)
         return self._neighbor_cache[1:]
 
+    def _time_position_bias(self, length, reference):
+        return self.time_bias(length, reference).transpose(0, 1)
+
+    def _attention_weights(self, logits):
+        return torch.softmax(logits, dim=-1)
+
     def forward(self, query_sources, event3d):
         q, k, v = self.project(query_sources, event3d)
         b, _, height, width = q.shape
@@ -244,7 +250,7 @@ class LocalSTRead(_ProjectedReader):
         k = k.reshape(b, self.num_heads, self.head_dim, length, n).permute(0, 1, 3, 4, 2)
         v = v.reshape(b, self.num_heads, self.head_dim, length, n).permute(0, 1, 3, 4, 2)
         index, valid = self.neighbors(height, width, q.device)
-        time_bias = self.time_bias(length, q).transpose(0, 1)
+        time_bias = self._time_position_bias(length, q)
         outputs = []
         for start in range(0, n, self.query_chunk):
             end = min(start + self.query_chunk, n)
@@ -269,7 +275,7 @@ class LocalSTRead(_ProjectedReader):
                     bias = bias.reshape(self.num_heads, 1, length * neighbors)
                     mask = mask[:, None, :].expand(-1, length, -1).reshape(end - start, length * neighbors)
                     logits = (logits + bias).masked_fill(~mask[None, None], float("-inf"))
-                    weights = torch.softmax(logits, dim=-1)
+                    weights = self._attention_weights(logits)
                 return torch.einsum("bhnl,bhnld->bhnd", weights.to(vc.dtype), vc)
 
             if self.checkpoint_chunks and self.training and torch.is_grad_enabled():
@@ -279,6 +285,28 @@ class LocalSTRead(_ProjectedReader):
             outputs.append(output)
         mixed = torch.cat(outputs, dim=2).permute(0, 1, 3, 2).reshape(b, self.width, height, width)
         return self.out_proj(mixed).to(query_sources[0].dtype)
+
+
+class ConditionalSpatialRead(LocalSTRead):
+    """Read each frame's neighborhood conditionally, then average frames equally."""
+
+    def __init__(self, channels, condition_channels, reduction=4, min_dim=8,
+                 query_chunk=512, checkpoint_chunks=True, kernel_size=3):
+        super().__init__(channels, condition_channels, num_heads=1, reduction=reduction,
+                         min_dim=min_dim, query_chunk=query_chunk,
+                         checkpoint_chunks=checkpoint_chunks, kernel_size=kernel_size,
+                         spatial_bias=False)
+        # Consume L's initialization draws, but remove the bias that cancels within each frame.
+        del self.time_bias
+
+    def _time_position_bias(self, length, reference):
+        return reference.new_zeros((self.num_heads, length))
+
+    def _attention_weights(self, logits):
+        length = logits.shape[-1] // self.neighbor_count
+        per_frame = logits.reshape(*logits.shape[:-1], length, self.neighbor_count)
+        weights = torch.softmax(per_frame, dim=-1) / length
+        return weights.reshape_as(logits)
 
 
 def grouped_dynamic_filter(x, kernels):
@@ -325,13 +353,15 @@ class _FusionBase(nn.Module):
                 self.channels, self.channels * sources,
                 self.options["temporal_reduction"], self.options["temporal_min_dim"],
             )
-        if kind == "local":
-            return LocalSTRead(
-                self.channels, self.channels * sources, num_heads=1,
+        if kind in ("local", "spatial"):
+            reader = LocalSTRead if kind == "local" else ConditionalSpatialRead
+            extra = {"num_heads": 1, "spatial_bias": False} if kind == "local" else {}
+            return reader(
+                self.channels, self.channels * sources,
                 reduction=self.options["temporal_reduction"], min_dim=self.options["temporal_min_dim"],
                 query_chunk=self.options["local_st_query_chunk"],
                 checkpoint_chunks=self.options["local_st_checkpoint_chunks"],
-                kernel_size=3, spatial_bias=False,
+                kernel_size=3, **extra,
             )
         return ConditionalTemporalRead(
             self.channels, self.channels * sources,
